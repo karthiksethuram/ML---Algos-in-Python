@@ -1,130 +1,133 @@
 import pandas as pd
 import numpy as np
-from scipy import stats
 from sklearn.linear_model import LogisticRegression
-from sklearn.neighbors import NearestNeighbors
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import pairwise_distances
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-# ================================================================
-# 1️⃣ Helper: Standardized Mean Difference & Balance Summary
-# ================================================================
-def smd(x_treat, x_ctrl):
-    return (x_treat.mean() - x_ctrl.mean()) / np.sqrt((x_treat.var() + x_ctrl.var()) / 2)
+# ==============================
+# STEP 1: Estimate Propensity Scores
+# ==============================
 
-def balance_table(df, covariates):
-    treat = df[df['group'] == 1]
-    ctrl = df[df['group'] == 0]
-    results = []
-    for cov in covariates:
-        x_treat, x_ctrl = treat[cov].dropna(), ctrl[cov].dropna()
-        smd_val = smd(x_treat, x_ctrl)
-        if df[cov].nunique() > 2:
-            t, p = stats.ttest_ind(x_treat, x_ctrl, equal_var=False)
-        else:
-            contingency = pd.crosstab(df['group'], df[cov])
-            _, p, _, _ = stats.chi2_contingency(contingency)
-        results.append({
-            'Variable': cov,
-            'SMD': round(smd_val, 3),
-            'P-value': round(p, 4)
-        })
-    return pd.DataFrame(results)
+def estimate_propensity_scores(df, covariates, group_col='group'):
+    X = df[covariates].copy()
+    y = df[group_col]
 
-# ================================================================
-# 2️⃣ Estimate Propensity Scores
-# ================================================================
-def estimate_propensity(df, covariates):
-    X = df[covariates]
-    y = df['group']
-    ps_model = LogisticRegression(max_iter=1000)
-    ps_model.fit(X, y)
-    df['pscore'] = ps_model.predict_proba(X)[:, 1]
-    return df
+    # Handle missing values
+    X = X.fillna(X.median())
 
-# ================================================================
-# 3️⃣ Matching Function (1-to-2, Caliper 0.05)
-# ================================================================
-def match_members(df, caliper=0.05, ratio=2):
-    treated = df[df['group'] == 1].copy()
-    control = df[df['group'] == 0].copy()
-    matched_rows = []
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
 
-    for idx, row in treated.iterrows():
-        ctrl_pool = control[np.abs(control['pscore'] - row['pscore']) <= caliper]
-        if len(ctrl_pool) < ratio:
-            continue
-        ctrl_pool = ctrl_pool.assign(dist=np.abs(ctrl_pool['pscore'] - row['pscore']))
-        top_matches = ctrl_pool.nsmallest(ratio, 'dist')
-        top_matches['match_id'] = idx
-        matched_rows.append(top_matches)
+    model = LogisticRegression(max_iter=1000)
+    model.fit(X_scaled, y)
+    df['pscore'] = model.predict_proba(X_scaled)[:, 1]
 
-    if matched_rows:
-        matched_ctrl = pd.concat(matched_rows)
-        matched_treat = treated.loc[matched_ctrl['match_id'].unique()]
-        matched_df = pd.concat([matched_treat, matched_ctrl])
-        return matched_df
-    else:
-        raise ValueError("No matches found. Try increasing caliper or using 1:1 matching.")
+    return df, model
 
-# ================================================================
-# 4️⃣ Visualization Functions
-# ================================================================
-def plot_pscore_distribution(df, matched_df):
-    plt.figure(figsize=(8,4))
-    sns.kdeplot(data=df, x='pscore', hue='group', fill=True, alpha=0.3, common_norm=False)
-    plt.title("Pre-Match Propensity Score Overlap")
-    plt.show()
 
-    plt.figure(figsize=(8,4))
-    sns.kdeplot(data=matched_df, x='pscore', hue='group', fill=True, alpha=0.3, common_norm=False)
-    plt.title("Post-Match Propensity Score Overlap")
-    plt.show()
+# ==============================
+# STEP 2: Propensity Score Matching (No Replacement)
+# ==============================
 
-def plot_love_chart(pre, post):
-    merged = pre.merge(post, on='Variable', suffixes=('_pre', '_post'))
-    plt.figure(figsize=(6,4))
-    plt.scatter(merged['SMD_pre'], merged['Variable'], label='Pre-Match', color='red')
-    plt.scatter(merged['SMD_post'], merged['Variable'], label='Post-Match', color='blue')
-    plt.axvline(x=0.1, color='grey', linestyle='--')
-    plt.axvline(x=-0.1, color='grey', linestyle='--')
-    plt.title('Standardized Mean Differences (Love Plot)')
-    plt.xlabel('SMD')
+def match_members(df, group_col='group', caliper=0.05, ratio=1):
+    treated = df[df[group_col] == 1].copy()
+    control = df[df[group_col] == 0].copy()
+
+    # Convert to arrays for faster distance computation
+    treated_scores = treated['pscore'].values.reshape(-1, 1)
+    control_scores = control['pscore'].values.reshape(-1, 1)
+
+    # Compute absolute distance matrix
+    distances = pairwise_distances(treated_scores, control_scores, metric='euclidean')
+
+    matched_indices = []
+    used_controls = set()
+
+    for i, row_dists in enumerate(distances):
+        # Sort control indices by closeness in propensity score
+        sorted_idx = np.argsort(row_dists)
+        selected = []
+
+        for idx in sorted_idx:
+            if row_dists[idx] <= caliper and idx not in used_controls:
+                selected.append(idx)
+                used_controls.add(idx)
+                if len(selected) >= ratio:
+                    break
+        if selected:
+            for ctrl_idx in selected:
+                matched_indices.append((treated.index[i], control.index[ctrl_idx]))
+
+    # Create matched DataFrame
+    matched_pairs = []
+    for t_idx, c_idx in matched_indices:
+        matched_pairs.append(df.loc[t_idx])
+        matched_pairs.append(df.loc[c_idx])
+
+    matched_df = pd.DataFrame(matched_pairs).reset_index(drop=True)
+
+    # Remove any duplicates that slipped through
+    matched_df = matched_df.drop_duplicates(subset=['member_id']).reset_index(drop=True)
+
+    return matched_df
+
+
+# ==============================
+# STEP 3: Evaluate Balance (Before/After)
+# ==============================
+
+def plot_balance(df_before, df_after, covariates):
+    def smd(df, covariate):
+        x1 = df[df['group'] == 1][covariate]
+        x0 = df[df['group'] == 0][covariate]
+        return (x1.mean() - x0.mean()) / np.sqrt(0.5 * (x1.var() + x0.var()))
+
+    before_smd = [smd(df_before, cov) for cov in covariates]
+    after_smd = [smd(df_after, cov) for cov in covariates]
+
+    plt.figure(figsize=(10, 6))
+    sns.scatterplot(x=before_smd, y=after_smd)
+    plt.axvline(0.1, color='red', linestyle='--', label='|SMD|=0.1 threshold')
+    plt.axhline(0.1, color='red', linestyle='--')
+    plt.xlabel('Before Matching SMD')
+    plt.ylabel('After Matching SMD')
+    plt.title('Covariate Balance Before vs After Matching')
     plt.legend()
-    plt.tight_layout()
     plt.show()
 
-# ================================================================
-# 5️⃣ Run Entire Pipeline
-# ================================================================
-def run_matching_pipeline(df, covariates, caliper=0.05, ratio=2):
-    print("=== Step 1: Estimate Propensity Scores ===")
-    df = estimate_propensity(df, covariates)
+    balance_df = pd.DataFrame({
+        'Covariate': covariates,
+        'Before_SMD': before_smd,
+        'After_SMD': after_smd
+    })
+    print(balance_df)
 
-    print("=== Step 2: Pre-Match Balance ===")
-    pre_balance = balance_table(df, covariates)
-    print(pre_balance)
 
-    print("=== Step 3: Perform Matching ===")
-    matched_df = match_members(df, caliper=caliper, ratio=ratio)
+# ==============================
+# STEP 4: Run the Matching Workflow
+# ==============================
 
-    print("=== Step 4: Post-Match Balance ===")
-    post_balance = balance_table(matched_df, covariates)
-    print(post_balance)
+# Example covariates (replace with your actual ones)
+covariates = ['new_vs_existing', 'pdc', 'age', 'diabetic_fills']
 
-    print("=== Step 5: Balance Improvement ===")
-    balance_compare = pre_balance.merge(post_balance, on='Variable', suffixes=('_pre', '_post'))
-    balance_compare['SMD_reduction'] = np.abs(balance_compare['SMD_pre']) - np.abs(balance_compare['SMD_post'])
-    print(balance_compare[['Variable', 'SMD_pre', 'SMD_post', 'SMD_reduction']])
+# 1. Estimate Propensity Scores
+df, ps_model = estimate_propensity_scores(df, covariates)
 
-    print("=== Step 6: Plots ===")
-    plot_pscore_distribution(df, matched_df)
-    plot_love_chart(pre_balance, post_balance)
+# 2. Perform Matching (1:1 example, caliper 0.05)
+df_matched = match_members(df, caliper=0.05, ratio=1)
 
-    return matched_df, balance_compare
+# 3. Compare counts
+print("Unique member counts BEFORE matching:")
+print(df.groupby('group')['member_id'].nunique())
 
-# ================================================================
-# 6️⃣ Example Run
-# ================================================================
-# covariates = ['age', 'baseline_pdc', 'new_vs_existing', 'diabetic_fills']
-# matched_df, balance_compare = run_matching_pipeline(df, covariates)
+print("\nUnique member counts AFTER matching:")
+print(df_matched.groupby('group')['member_id'].nunique())
+
+# 4. Plot balance improvement
+plot_balance(df, df_matched, covariates)
+
+# 5. Quick sanity check
+print("\nTotal rows after matching:", df_matched.shape[0])
+print("Unique members after matching:", df_matched['member_id'].nunique())
