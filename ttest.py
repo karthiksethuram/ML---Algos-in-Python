@@ -1,30 +1,50 @@
 from scipy import stats
 
-# --- 1. Compute group-wise fill rates ---
-group_stats = (
-    df_matched.groupby('group')['statin_filled']
-    .agg(['mean', 'count', 'std'])
-    .rename(columns={'mean': 'fill_rate', 'count': 'n', 'std': 'std_dev'})
-)
+# Ensure Statin_Filled and MEMBER_STATUS exist in matched data
+assert 'Statin_Filled' in df_matched.columns, "Statin_Filled variable not found in df_matched"
+assert 'MEMBER_STATUS' in df_matched.columns, "MEMBER_STATUS variable not found in df_matched"
 
-print("Group-wise Statin Fill Rates:")
-print(group_stats)
-print("\n")
+print("\n=== 💊 Outcome Analysis: Statin_Filled ===")
 
-# --- 2. Run Welch’s t-test (unequal variances) ---
-target = df_matched[df_matched['group'] == 1]['statin_filled']
-control = df_matched[df_matched['group'] == 0]['statin_filled']
+# ---- 1️⃣ Overall difference ----
+treated = df_matched[df_matched['treatment'] == 1]
+control = df_matched[df_matched['treatment'] == 0]
 
-t_stat, p_val = stats.ttest_ind(target, control, equal_var=False)
+t_stat, p_val = stats.ttest_ind(treated['Statin_Filled'], control['Statin_Filled'], equal_var=False)
 
-# --- 3. Print results ---
-print("Welch’s t-test results:")
-print(f"T-statistic: {t_stat:.4f}")
-print(f"P-value: {p_val:.4e}")
+mean_treated = treated['Statin_Filled'].mean()
+mean_control = control['Statin_Filled'].mean()
+delta = mean_treated - mean_control
 
-# --- 4. Interpretation ---
-alpha = 0.05
-if p_val < alpha:
-    print("\n✅ The difference in statin fill rates between groups is statistically significant (p < 0.05).")
-else:
-    print("\n❌ No statistically significant difference in statin fill rates between groups (p ≥ 0.05).")
+print(f"\nOverall:")
+print(f"Mean (Target group): {mean_treated:.3f}")
+print(f"Mean (Control group): {mean_control:.3f}")
+print(f"Δ (Difference): {delta:.3f}")
+print(f"t = {t_stat:.3f}, p = {p_val:.4f}")
+
+# ---- 2️⃣ By MEMBER_STATUS (New vs Returning) ----
+print("\n=== 🧩 Subgroup Analysis by MEMBER_STATUS ===")
+
+for status in df_matched['MEMBER_STATUS'].unique():
+    subset = df_matched[df_matched['MEMBER_STATUS'] == status]
+    treated_sub = subset[subset['treatment'] == 1]
+    control_sub = subset[subset['treatment'] == 0]
+
+    if treated_sub.shape[0] > 1 and control_sub.shape[0] > 1:
+        t_stat, p_val = stats.ttest_ind(
+            treated_sub['Statin_Filled'],
+            control_sub['Statin_Filled'],
+            equal_var=False
+        )
+
+        mean_treated = treated_sub['Statin_Filled'].mean()
+        mean_control = control_sub['Statin_Filled'].mean()
+        delta = mean_treated - mean_control
+
+        print(f"\nMember Status: {status}")
+        print(f"Mean (Target): {mean_treated:.3f}")
+        print(f"Mean (Control): {mean_control:.3f}")
+        print(f"Δ (Difference): {delta:.3f}")
+        print(f"t = {t_stat:.3f}, p = {p_val:.4f}")
+    else:
+        print(f"\nMember Status: {status} — insufficient data for both groups.")
