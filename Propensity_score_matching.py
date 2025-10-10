@@ -31,22 +31,43 @@ for var in ['MBR_AGE_FILLD', 'diab_fills_PY', 'statin_fills_PY']:
 model = LogisticRegression(max_iter=1000)
 model.fit(df_encoded[covariates], df_encoded['treatment'])
 df['propensity_score'] = model.predict_proba(df_encoded[covariates])[:, 1]
+from sklearn.metrics import pairwise_distances
 
 # =========================================
-# STEP 3️⃣: 1:1 Nearest Neighbor Matching (no replacement)
+# STEP 3️⃣: True 1:1 Nearest Neighbor Matching (without replacement)
 # =========================================
 treated = df[df['treatment'] == 1].copy()
 control = df[df['treatment'] == 0].copy()
 
-nn = NearestNeighbors(n_neighbors=1)
-nn.fit(control[['propensity_score']])
-distances, indices = nn.kneighbors(treated[['propensity_score']])
+treated = treated.sample(frac=1, random_state=42).reset_index(drop=True)  # shuffle to avoid bias
+control_available = control.copy()
 
-matched_control = control.iloc[indices.flatten()].copy()
-matched_control['match_id'] = treated.index
-treated['match_id'] = treated.index
+matches = []
+caliper = 0.05  # optional: max allowable propensity score distance
 
-df_matched = pd.concat([treated, matched_control], axis=0)
+for i, row in treated.iterrows():
+    # compute absolute distance between this treated and all available controls
+    control_available['distance'] = abs(control_available['propensity_score'] - row['propensity_score'])
+    nearest = control_available.loc[control_available['distance'].idxmin()]
+
+    # apply caliper constraint (optional but recommended)
+    if nearest['distance'] <= caliper:
+        matches.append((row.name, nearest.name))
+        control_available = control_available.drop(nearest.name)
+    
+    # stop if controls exhausted
+    if control_available.empty:
+        break
+
+# get matched data
+treated_matched = treated.loc[[m[0] for m in matches]].copy()
+control_matched = control.loc[[m[1] for m in matches]].copy()
+
+treated_matched['match_id'] = range(len(matches))
+control_matched['match_id'] = range(len(matches))
+
+df_matched = pd.concat([treated_matched, control_matched], axis=0)
+print(f"Matched {len(matches)} treated-control pairs.")
 
 # =========================================
 # STEP 4️⃣: Define balance checking function
