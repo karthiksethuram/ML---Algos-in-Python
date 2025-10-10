@@ -5,17 +5,25 @@ from sklearn.neighbors import NearestNeighbors
 from scipy import stats
 
 # =========================================
-# STEP 1️⃣: Prepare data
+# STEP 1️⃣: Prepare and clean data
 # =========================================
-# prescriber_group: 'target_control_group' (treated) vs 'control_only_group' (control)
 df = df.copy()
+
+# prescriber_group: 'target_control_group' (treated) vs 'control_only_group' (control)
 df['treatment'] = (df['prescriber_group'] == 'target_control_group').astype(int)
+
+# Handle missing categorical variable (MEMBER_STATUS)
+df['MEMBER_STATUS'] = df['MEMBER_STATUS'].fillna(df['MEMBER_STATUS'].mode()[0])
 
 # One-hot encode MEMBER_STATUS (New/Returning)
 df_encoded = pd.get_dummies(df, columns=['MEMBER_STATUS'], drop_first=True)
 
 # Covariates for matching
 covariates = ['MBR_AGE_FILLD', 'diab_fills_PY', 'statin_fills_PY', 'MEMBER_STATUS_Returning']
+
+# Handle missing numeric values (impute with median)
+for var in ['MBR_AGE_FILLD', 'diab_fills_PY', 'statin_fills_PY']:
+    df_encoded[var] = df_encoded[var].fillna(df_encoded[var].median())
 
 # =========================================
 # STEP 2️⃣: Estimate propensity scores
@@ -72,6 +80,9 @@ print(pre_table, "\n")
 
 print("=== 🔄 Post-Matching Balance Check ===")
 df_matched_encoded = pd.get_dummies(df_matched, columns=['MEMBER_STATUS'], drop_first=True)
+for var in ['MBR_AGE_FILLD', 'diab_fills_PY', 'statin_fills_PY']:
+    df_matched_encoded[var] = df_matched_encoded[var].fillna(df_matched_encoded[var].median())
+
 post_table = balance_table(df_matched_encoded.assign(treatment=df_matched['treatment']), 'treatment', covariates)
 print(post_table, "\n")
 
