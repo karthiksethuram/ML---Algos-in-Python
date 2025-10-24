@@ -1,5 +1,5 @@
 WITH RECURSIVE recursive_calc AS (
-  -- Step 1: Aggregate same-day fills and assign order
+  -- 🔹 Anchor: first fill per member–drug_cls–year
   SELECT
     lvl1_acct_gid,
     eph_id,
@@ -11,7 +11,9 @@ WITH RECURSIVE recursive_calc AS (
     ROW_NUMBER() OVER (
       PARTITION BY lvl1_acct_gid, eph_id, drug_cls, fill_year
       ORDER BY fill_dt
-    ) AS rn
+    ) AS rn,
+    0 AS days_between,
+    SUM(day_sply_qty) AS running_excess
   FROM `your_dataset.your_table_name`
   GROUP BY
     lvl1_acct_gid,
@@ -20,10 +22,11 @@ WITH RECURSIVE recursive_calc AS (
     drug_name,
     fill_year,
     fill_dt
+  QUALIFY rn = 1
 
   UNION ALL
 
-  -- Step 2: Recursive logic to compute running excess
+  -- 🔹 Recursive: compute running excess for next fills
   SELECT
     b.lvl1_acct_gid,
     b.eph_id,
@@ -33,12 +36,14 @@ WITH RECURSIVE recursive_calc AS (
     b.fill_dt,
     b.day_sply_qty,
     b.rn,
+    DATE_DIFF(b.fill_dt, p.fill_dt, DAY) AS days_between,
     CASE
       WHEN (p.running_excess + p.day_sply_qty - DATE_DIFF(b.fill_dt, p.fill_dt, DAY)) < 0 THEN 0
       ELSE (p.running_excess + p.day_sply_qty - DATE_DIFF(b.fill_dt, p.fill_dt, DAY))
     END AS running_excess
   FROM recursive_calc p
   JOIN (
+    -- pre-aggregated base table (same-day fills combined)
     SELECT
       lvl1_acct_gid,
       eph_id,
