@@ -4,34 +4,29 @@ WITH RECURSIVE recursive_calc AS (
     lvl1_acct_gid,
     eph_id,
     drug_cls,
-    drug_name,
+    ANY_VALUE(drug_name) AS drug_name,  -- arbitrary since class-level logic
     fill_year,
     fill_dt,
-    SUM(day_sply_qty) AS day_sply_qty,
+    MAX(day_sply_qty) AS day_sply_qty,  -- use MAX to avoid overlap stacking
     ROW_NUMBER() OVER (
       PARTITION BY lvl1_acct_gid, eph_id, drug_cls, fill_year
       ORDER BY fill_dt
     ) AS rn,
     0 AS days_between,
-    SUM(day_sply_qty) AS running_excess
+    MAX(day_sply_qty) AS running_excess
   FROM `your_dataset.your_table_name`
   GROUP BY
-    lvl1_acct_gid,
-    eph_id,
-    drug_cls,
-    drug_name,
-    fill_year,
-    fill_dt
+    lvl1_acct_gid, eph_id, drug_cls, fill_year, fill_dt
   QUALIFY rn = 1
 
   UNION ALL
 
-  -- 🔹 Recursive: compute running excess for next fills
+  -- 🔹 Recursive step
   SELECT
     b.lvl1_acct_gid,
     b.eph_id,
     b.drug_cls,
-    b.drug_name,
+    ANY_VALUE(b.drug_name) AS drug_name,
     b.fill_year,
     b.fill_dt,
     b.day_sply_qty,
@@ -43,27 +38,20 @@ WITH RECURSIVE recursive_calc AS (
     END AS running_excess
   FROM recursive_calc p
   JOIN (
-    -- pre-aggregated base table (same-day fills combined)
     SELECT
       lvl1_acct_gid,
       eph_id,
       drug_cls,
-      drug_name,
+      ANY_VALUE(drug_name) AS drug_name,
       fill_year,
       fill_dt,
-      SUM(day_sply_qty) AS day_sply_qty,
+      MAX(day_sply_qty) AS day_sply_qty,  -- ✅ only max per drug_cls/day
       ROW_NUMBER() OVER (
         PARTITION BY lvl1_acct_gid, eph_id, drug_cls, fill_year
         ORDER BY fill_dt
       ) AS rn
     FROM `your_dataset.your_table_name`
-    GROUP BY
-      lvl1_acct_gid,
-      eph_id,
-      drug_cls,
-      drug_name,
-      fill_year,
-      fill_dt
+    GROUP BY lvl1_acct_gid, eph_id, drug_cls, fill_year, fill_dt
   ) b
   ON b.lvl1_acct_gid = p.lvl1_acct_gid
   AND b.eph_id = p.eph_id
