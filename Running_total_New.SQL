@@ -1,5 +1,22 @@
--- 1) base intervals per fill
-WITH fills AS (
+-- Replace `your_table` with your table name
+WITH RECURSIVE
+base AS (
+  SELECT
+    lvl1_acct_gid,
+    eph_id,
+    drug_cls,
+    drug_name,
+    fill_year,
+    DATE(fill_dt) AS fill_dt,
+    day_sply_qty,
+    LAG(DATE(fill_dt)) OVER (
+      PARTITION BY lvl1_acct_gid, eph_id, drug_cls, fill_year
+      ORDER BY DATE(fill_dt)
+    ) AS prev_fill_dt
+  FROM `your_project.your_dataset.your_table`
+),
+
+gap_calc AS (
   SELECT
     lvl1_acct_gid,
     eph_id,
@@ -8,105 +25,102 @@ WITH fills AS (
     fill_year,
     fill_dt,
     day_sply_qty,
-    DATE_ADD(fill_dt, INTERVAL day_sply_qty - 1 DAY) AS end_dt
-  FROM `project.dataset.fills`
-  WHERE fill_dt >= '2024-01-01'
+    prev_fill_dt,
+    CASE
+      WHEN prev_fill_dt IS NULL THEN NULL
+      ELSE DATE_DIFF(fill_dt, prev_fill_dt, DAY)
+    END AS gap_days
+  FROM base
 ),
 
--- 2) aggregated total supply per class (no duplication)
-class_total AS (
+-- Aggregate multiple drug_name fills occurring on the same date (same cls)
+agg_by_fill AS (
   SELECT
     lvl1_acct_gid,
     eph_id,
     drug_cls,
     fill_year,
-    SUM(day_sply_qty) AS total_days_supplied
-  FROM fills
-  GROUP BY lvl1_acct_gid, eph_id, drug_cls, fill_year
+    fill_dt,
+    SUM(day_sply_qty) AS total_day_sply_qty,
+    MIN(gap_days) AS gap_days  -- gap_days is the same for rows with same fill_dt, MIN is safe
+  FROM gap_calc
+  GROUP BY lvl1_acct_gid, eph_id, drug_cls, fill_year, fill_dt
 ),
 
--- 3) order intervals across all drugs in same class
-ordered_intervals AS (
+ordered_fills AS (
   SELECT
-    lvl1_acct_gid,
-    eph_id,
-    drug_cls,
-    fill_year,
-    fill_dt AS start_dt,
-    end_dt,
+    *,
     ROW_NUMBER() OVER (
       PARTITION BY lvl1_acct_gid, eph_id, drug_cls, fill_year
-      ORDER BY fill_dt, end_dt
-    ) AS rn
-  FROM fills
+      ORDER BY fill_dt
+    ) AS rn,
+    COUNT(*) OVER (
+      PARTITION BY lvl1_acct_gid, eph_id, drug_cls, fill_year
+    ) AS cnt_fills
+  FROM agg_by_fill
 ),
 
--- 4) recursively merge overlapping/contiguous intervals per class
---    produces non-overlapping merged segments
-RECURSIVE merged AS (
-  -- base: first interval in each partition
+-- Recursive CTE to compute running_excess
+running_excess AS (
+  -- anchor: first fill (rn = 1)
   SELECT
     lvl1_acct_gid,
     eph_id,
     drug_cls,
     fill_year,
+    fill_dt,
+    total_day_sply_qty,
+    gap_days,
     rn,
-    start_dt,
-    end_dt
-  FROM ordered_intervals
+    cnt_fills,
+    total_day_sply_qty AS running_excess
+  FROM ordered_fills
   WHERE rn = 1
 
   UNION ALL
 
+  -- recursive step: next fill (rn = prev.rn + 1)
   SELECT
-    o.lvl1_acct_gid,
-    o.eph_id,
-    o.drug_cls,
-    o.fill_year,
-    o.rn,
-    CASE
-      WHEN o.start_dt <= DATE_ADD(m.end_dt, INTERVAL 1 DAY) THEN m.start_dt
-      ELSE o.start_dt
-    END AS start_dt,
-    CASE
-      WHEN o.start_dt <= DATE_ADD(m.end_dt, INTERVAL 1 DAY) THEN GREATEST(m.end_dt, o.end_dt)
-      ELSE o.end_dt
-    END AS end_dt
-  FROM merged m
-  JOIN ordered_intervals o
-    ON o.lvl1_acct_gid = m.lvl1_acct_gid
-    AND o.eph_id = m.eph_id
-    AND o.drug_cls = m.drug_cls
-    AND o.fill_year = m.fill_year
-    AND o.rn = m.rn + 1
-  -- note: join condition intentionally does not filter o.start_dt > m.end_dt
-  -- because the CASE above handles overlap vs non-overlap
-),
-
--- 5) deduplicate merged segments: keep only rows that represent final merged segments
---    (the recursive merge may produce intermediate rows; selecting distinct start/end per rn)
-final_segments AS (
-  SELECT DISTINCT
-    lvl1_acct_gid,
-    eph_id,
-    drug_cls,
-    fill_year,
-    start_dt,
-    end_dt
-  FROM merged
+    nxt.lvl1_acct_gid,
+    nxt.eph_id,
+    nxt.drug_cls,
+    nxt.fill_year,
+    nxt.fill_dt,
+    nxt.total_day_sply_qty,
+    nxt.gap_days,
+    nxt.rn,
+    nxt.cnt_fills,
+    -- compute new running_excess and clamp at 0
+    GREATEST(0,
+      prev.running_excess
+      - COALESCE(nxt.gap_days, 0)   -- days lost to gap since previous fill
+      + nxt.total_day_sply_qty      -- days from this fill
+    ) AS running_excess
+  FROM running_excess AS prev
+  JOIN ordered_fills AS nxt
+    ON prev.lvl1_acct_gid = nxt.lvl1_acct_gid
+   AND prev.eph_id = nxt.eph_id
+   AND prev.drug_cls = nxt.drug_cls
+   AND prev.fill_year = nxt.fill_year
+   AND nxt.rn = prev.rn + 1
 )
 
--- 6) compute unique covered days per class and join with total supply
+-- Final outputs:
+-- 1) detailed running_excess per fill row
+-- 2) current_excess per lvl1_acct_gid,eph_id,drug_cls,fill_year (latest fill)
 SELECT
-  t.lvl1_acct_gid,
-  t.eph_id,
-  t.drug_cls,
-  t.fill_year,
-  t.total_days_supplied,
-  COALESCE(SUM(DATE_DIFF(s.end_dt, s.start_dt, DAY) + 1), 0) AS unique_covered_days,
-  t.total_days_supplied - COALESCE(SUM(DATE_DIFF(s.end_dt, s.start_dt, DAY) + 1), 0) AS excess_med_in_hand_class_level
-FROM class_total t
-LEFT JOIN final_segments s
-  USING (lvl1_acct_gid, eph_id, drug_cls, fill_year)
-GROUP BY t.lvl1_acct_gid, t.eph_id, t.drug_cls, t.fill_year, t.total_days_supplied
-ORDER BY t.lvl1_acct_gid, t.eph_id, t.drug_cls, t.fill_year;
+  re.lvl1_acct_gid,
+  re.eph_id,
+  re.drug_cls,
+  re.fill_year,
+  re.fill_dt,
+  re.total_day_sply_qty,
+  re.gap_days,
+  re.running_excess
+FROM running_excess AS re
+ORDER BY re.lvl1_acct_gid, re.eph_id, re.drug_cls, re.fill_dt;
+
+-- If you want the current (latest) excess per group, run:
+-- SELECT lvl1_acct_gid, eph_id, drug_cls, fill_year, ARRAY_REVERSE_AGG(STRUCT(fill_dt, running_excess))[OFFSET(0)].*
+-- FROM running_excess
+-- GROUP BY lvl1_acct_gid, eph_id, drug_cls, fill_year;
