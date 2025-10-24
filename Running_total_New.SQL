@@ -1,13 +1,14 @@
 WITH RECURSIVE recursive_calc AS (
-  -- 🔹 Anchor: first fill per member–drug_cls–year
+
+  -- 🔹 Anchor: first fill (same-day fills collapsed with MAX logic)
   SELECT
     lvl1_acct_gid,
     eph_id,
     drug_cls,
-    ANY_VALUE(drug_name) AS drug_name,  -- arbitrary since class-level logic
+    ANY_VALUE(drug_name) AS drug_name,
     fill_year,
     fill_dt,
-    MAX(day_sply_qty) AS day_sply_qty,  -- use MAX to avoid overlap stacking
+    MAX(day_sply_qty) AS day_sply_qty,
     ROW_NUMBER() OVER (
       PARTITION BY lvl1_acct_gid, eph_id, drug_cls, fill_year
       ORDER BY fill_dt
@@ -26,7 +27,7 @@ WITH RECURSIVE recursive_calc AS (
     b.lvl1_acct_gid,
     b.eph_id,
     b.drug_cls,
-    ANY_VALUE(b.drug_name) AS drug_name,
+    b.drug_name,
     b.fill_year,
     b.fill_dt,
     b.day_sply_qty,
@@ -45,14 +46,14 @@ WITH RECURSIVE recursive_calc AS (
       ANY_VALUE(drug_name) AS drug_name,
       fill_year,
       fill_dt,
-      MAX(day_sply_qty) AS day_sply_qty,  -- ✅ only max per drug_cls/day
+      MAX(day_sply_qty) AS day_sply_qty,
       ROW_NUMBER() OVER (
         PARTITION BY lvl1_acct_gid, eph_id, drug_cls, fill_year
         ORDER BY fill_dt
       ) AS rn
     FROM `your_dataset.your_table_name`
     GROUP BY lvl1_acct_gid, eph_id, drug_cls, fill_year, fill_dt
-  ) b
+  ) AS b
   ON b.lvl1_acct_gid = p.lvl1_acct_gid
   AND b.eph_id = p.eph_id
   AND b.drug_cls = p.drug_cls
@@ -60,6 +61,7 @@ WITH RECURSIVE recursive_calc AS (
   AND b.rn = p.rn + 1
 )
 
+-- 🔹 Final output
 SELECT
   lvl1_acct_gid,
   eph_id,
