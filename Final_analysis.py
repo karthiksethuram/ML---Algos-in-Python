@@ -1,38 +1,34 @@
-# Requirements:
-# pip install pandas numpy statsmodels scikit-learn matplotlib patsy
-
 import pandas as pd
 import numpy as np
 import statsmodels.api as sm
 import matplotlib.pyplot as plt
 from statsmodels.stats.outliers_influence import variance_inflation_factor
 
-# -----------------------
-# 1) INPUT: your dataframe
-# -----------------------
+# ------------------------------------
+# 1. Load and preprocess
+# ------------------------------------
 # df = pd.read_csv("your_data.csv")
-
-# Expected columns:
-# npi_id, target_or_control, target_members, control_members, total_members,
-# EDS_conversion_flag_150d, star_pdc_py, member_status, star_drug_cls (DIAB/ACE_ARB/STATIN)
 
 df = df.copy()
 
-# -----------------------
-# 2) Feature engineering
-# -----------------------
+# Ensure clean column names
+df.columns = df.columns.str.strip()
 
-# Binary outcome
+# --- Binary outcome ---
 df['EDS_conv'] = df['EDS_conversion_flag_150d'].astype(int)
 
-# Target vs Control
-df['is_target_member'] = df['target_or_control'].astype(str).str.lower().map({
-    'target': 1, 't': 1, '1': 1,
-    'control': 0, 'c': 0, '0': 0
-}).fillna(0)
+# --- Target assignment ---
+df['is_target_member'] = (
+    df['target_or_control'].astype(str).str.lower().map({
+        'target': 1, 't': 1, '1': 1,
+        'control': 0, 'c': 0, '0': 0
+    }).fillna(0)
+).astype(int)
 
-# Prescriber-level target share
-df['total_members'] = df['total_members'].replace(0, np.nan)
+# --- Prescriber target share ---
+df['total_members'] = pd.to_numeric(df['total_members'], errors='coerce')
+df['target_members'] = pd.to_numeric(df['target_members'], errors='coerce')
+
 df['presc_target_share'] = df['target_members'] / df['total_members']
 
 if df['presc_target_share'].isnull().all():
@@ -41,135 +37,109 @@ if df['presc_target_share'].isnull().all():
 
 df['presc_any_target'] = (df['presc_target_share'] > 0).astype(int)
 
-# Member status dummy
+# --- Member status ---
 df['is_new_member'] = (df['member_status'].astype(str).str.lower() == 'new').astype(int)
 
-# Handle star_pdc_py missing values (0 for new, plus missingness flag)
+# --- Prior adherence ---
+df['star_pdc_py'] = pd.to_numeric(df['star_pdc_py'], errors='coerce')
 df['star_pdc_py_missing'] = df['star_pdc_py'].isnull().astype(int)
 df['star_pdc_py_imputed'] = df['star_pdc_py'].fillna(0.0)
 
-# Interaction term for spillover
+# --- Interaction term ---
 df['target_x_presc_share'] = df['is_target_member'] * df['presc_target_share']
 
-# Drug class dummy variables
-drug_dummies = pd.get_dummies(df['star_drug_cls'], prefix='cls')
-# Drop one baseline to avoid dummy trap (STATIN as baseline)
+# --- Drug class dummies ---
+df['star_drug_cls'] = df['star_drug_cls'].astype(str).str.upper().str.strip()
+drug_dummies = pd.get_dummies(df['star_drug_cls'], prefix='cls', dtype=int)
 if 'cls_STATIN' in drug_dummies.columns:
-    drug_dummies = drug_dummies.drop(columns=['cls_STATIN'])
+    drug_dummies = drug_dummies.drop(columns=['cls_STATIN'])  # baseline
+
 df = pd.concat([df, drug_dummies], axis=1)
 
-# -----------------------
-# 3) Model setup
-# -----------------------
+# ------------------------------------
+# 2. Modeling dataset
+# ------------------------------------
 model_df = df[[
     'npi_id', 'EDS_conv', 'is_target_member', 'presc_target_share', 'target_x_presc_share',
     'star_pdc_py_imputed', 'star_pdc_py_missing', 'is_new_member'
-] + list(drug_dummies.columns)].dropna(subset=['EDS_conv', 'npi_id'])
+] + list(drug_dummies.columns)].dropna(subset=['npi_id', 'EDS_conv'])
 
-# -----------------------
-# 4) Multicollinearity check
-# -----------------------
-X_for_vif = model_df.drop(columns=['npi_id', 'EDS_conv']).fillna(0.0)
-X_for_vif = sm.add_constant(X_for_vif)
+# Force numeric
+for col in model_df.columns:
+    if col not in ['npi_id']:
+        model_df[col] = pd.to_numeric(model_df[col], errors='coerce')
+
+# Drop any remaining non-numeric or all-NaN columns
+non_numeric = model_df.select_dtypes(exclude=[np.number]).columns.tolist()
+if non_numeric:
+    print("Dropping non-numeric columns:", non_numeric)
+    model_df = model_df.drop(columns=non_numeric)
+
+# Replace inf and NaN with 0 (safe default)
+model_df = model_df.replace([np.inf, -np.inf], np.nan).fillna(0)
+
+# ------------------------------------
+# 3. VIF check (optional)
+# ------------------------------------
+X_for_vif = sm.add_constant(model_df.drop(columns=['npi_id', 'EDS_conv']))
 vif_df = pd.DataFrame({
     'variable': X_for_vif.columns,
-    'VIF': [variance_inflation_factor(X_for_vif.values, i) for i in range(X_for_vif.shape[1])]
+    'VIF': [variance_inflation_factor(X_for_vif.values, i)
+            for i in range(X_for_vif.shape[1])]
 })
 print("VIF summary:\n", vif_df)
 
-# Drop high-VIF vars if any (optional)
-drop_vars = vif_df.loc[vif_df['VIF'] > 10, 'variable']
-if len(drop_vars) > 0:
-    print("Dropping high-VIF variables:", drop_vars.tolist())
-    model_df = model_df.drop(columns=[v for v in drop_vars if v != 'const'], errors='ignore')
-
-# -----------------------
-# 5) Fit OLS (Linear Probability Model)
-# -----------------------
-X = sm.add_constant(model_df.drop(columns=['npi_id', 'EDS_conv']), has_constant='add')
-y = model_df['EDS_conv']
+# ------------------------------------
+# 4. Fit OLS (Linear Probability Model)
+# ------------------------------------
+X = sm.add_constant(model_df.drop(columns=['npi_id', 'EDS_conv']), has_constant='add').astype(float)
+y = model_df['EDS_conv'].astype(float)
 
 ols_model = sm.OLS(y, X)
 ols_res = ols_model.fit(cov_type='cluster', cov_kwds={'groups': model_df['npi_id']})
+print("\nOLS Results Summary:")
 print(ols_res.summary())
 
-# -----------------------
-# 6) Fit Logistic Regression (Logit)
-# -----------------------
-logit_model = sm.Logit(y, X)
+# ------------------------------------
+# 5. Fit Logistic Regression (Logit)
+# ------------------------------------
+X_logit = X.copy()
 try:
+    logit_model = sm.Logit(y, X_logit)
     logit_res = logit_model.fit(disp=False, maxiter=200)
-except Exception as e:
-    print("Logit convergence issue:", e)
-    logit_res = logit_model.fit_regularized(alpha=0.1, disp=False)
-
-# Clustered SE for Logit
-try:
     logit_clus = logit_res.get_robustcov_results(cov_type='cluster', groups=model_df['npi_id'])
-except:
+except Exception as e:
+    print("⚠️ Logit convergence issue, trying regularized fit:", e)
+    logit_res = sm.Logit(y, X_logit).fit_regularized(alpha=0.1, disp=False)
     logit_clus = logit_res.get_robustcov_results(cov_type='HC1')
 
+print("\nLogit Results Summary:")
 print(logit_clus.summary())
 
-# -----------------------
-# 7) Marginal effects plot for presc_target_share
-# -----------------------
+# ------------------------------------
+# 6. Marginal effects plot
+# ------------------------------------
 if 'presc_target_share' in X.columns:
     grid = np.linspace(0, 1, 50)
-    base = X.drop(columns=['const']).mean()
+    base = X.mean()
     preds = []
     for t in [0, 1]:
         for s in grid:
             row = base.copy()
-            row['presc_target_share'] = s
             row['is_target_member'] = t
+            row['presc_target_share'] = s
             if 'target_x_presc_share' in row.index:
                 row['target_x_presc_share'] = t * s
-            row_df = sm.add_constant(pd.DataFrame([row]), has_constant='add')
-            pred = 1 / (1 + np.exp(-np.dot(row_df, logit_res.params)))
-            preds.append({'is_target_member': t, 'presc_target_share': s, 'pred_prob': pred[0, 0]})
+            pred_prob = 1 / (1 + np.exp(-np.dot(row, logit_res.params)))
+            preds.append({'is_target_member': t, 'presc_target_share': s, 'pred_prob': pred_prob})
     pred_df = pd.DataFrame(preds)
-
     plt.figure(figsize=(8, 5))
-    for t, label in zip([0, 1], ['Control member', 'Target member']):
+    for t, label in zip([0, 1], ['Control', 'Target']):
         sub = pred_df[pred_df['is_target_member'] == t]
         plt.plot(sub['presc_target_share'], sub['pred_prob'], label=label)
-    plt.xlabel('Prescriber target share')
-    plt.ylabel('Predicted EDS conversion probability')
-    plt.title('Marginal effects by prescriber target share')
+    plt.xlabel("Prescriber Target Share")
+    plt.ylabel("Predicted EDS Conversion Probability")
+    plt.title("Marginal Effect of Prescriber Target Share")
     plt.legend()
     plt.grid(True)
     plt.show()
-
-# -----------------------
-# 8) Combine results for interpretation
-# -----------------------
-def summarize_results(res_obj, model_label):
-    return pd.DataFrame({
-        'term': res_obj.params.index,
-        'coef': res_obj.params.values,
-        'std_err': res_obj.bse.values,
-        't_or_z': res_obj.tvalues if hasattr(res_obj, 'tvalues') else res_obj.zvalues,
-        'pval': res_obj.pvalues,
-        'model': model_label
-    })
-
-summary = pd.concat([
-    summarize_results(ols_res, 'OLS_LPM_clustered'),
-    summarize_results(logit_clus, 'Logit_clustered')
-])
-
-def interpret(term, coef, pval):
-    if 'is_target_member' in term:
-        return f"{'Higher' if coef > 0 else 'Lower'} EDS conversion for target vs control members ({coef:.3f}, p={pval:.3g})"
-    elif 'presc_target_share' == term:
-        return f"Evidence of spillover: prescribers with more targeted patients have {'higher' if coef > 0 else 'lower'} EDS ({coef:.3f}, p={pval:.3g})"
-    elif 'target_x_presc_share' in term:
-        return f"Interaction: treatment effect depends on prescriber exposure ({coef:.3f}, p={pval:.3g})"
-    elif term.startswith('cls_'):
-        drug = term.split('_')[1]
-        return f"Compared to STATIN (ref), {drug} class members show {'higher' if coef > 0 else 'lower'} EDS conversion ({coef:.3f}, p={pval:.3g})"
-    return ""
-
-summary['interpretation'] = summary.apply(lambda r: interpret(r['term'], r['coef'], r['pval']), axis=1)
-print(summary[['model', 'term', 'coef', 'std_err', 'pval', 'interpretation']])
