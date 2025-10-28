@@ -143,3 +143,25 @@ if 'presc_target_share' in X.columns:
     plt.legend()
     plt.grid(True)
     plt.show()
+
+
+# --- 4. Plot marginal effect for prescriber_target_share ---
+
+# Marginal effects of presc_target_share across its range
+presc_vals = pd.Series(sorted(df['presc_target_share'].unique()))
+marginal_effects = []
+
+for v in presc_vals:
+    temp_df = df.copy()
+    temp_df['presc_target_share'] = v
+    pred = logit_model.get_margeff(at='overall', method='dydx', atexog=temp_df).margeff[1]  # presc_share effect
+    marginal_effects.append(pred)
+
+plt.figure(figsize=(8,5))
+plt.plot(presc_vals, marginal_effects, color='blue', lw=2)
+plt.title("Marginal Effect of Prescriber Target Share on EDS Conversion")
+plt.xlabel("Prescriber Target Share")
+plt.ylabel("Average Marginal Effect")
+plt.grid(alpha=0.3)
+plt.show()
+
