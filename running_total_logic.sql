@@ -1,94 +1,105 @@
--- Replace this with your actual dataset/table name
-WITH RECURSIVE fills_sorted AS (
-  -- Step 1: Sort fills and compute lag values
+WITH RECURSIVE recursive_calc AS (
+
+  ----------------------------------------------------------------
+  -- ANCHOR: earliest fill per (lv1_acct_id, eph_id, drug_cls, fill_year)
+  -- Aggregate same-day fills by taking MAX(day_sply_qty)
+  ----------------------------------------------------------------
   SELECT
-    lvl1_acct_gid,
-    eph_id,
-    drug_cls,
-    fill_year,
-    fill_dt,
-    day_sply_qty,
+    a.lv1_acct_id,
+    a.eph_id,
+    a.drug_cls,
+    ANY_VALUE(a.drug_name) AS drug_name,
+    a.fill_year,
+    a.fill_dt,
+    MAX(a.day_sply_qty) AS day_sply_qty,
     ROW_NUMBER() OVER (
-      PARTITION BY lvl1_acct_gid, eph_id, drug_cls, fill_year
-      ORDER BY fill_dt
+      PARTITION BY a.lv1_acct_id, a.eph_id, a.drug_cls, a.fill_year
+      ORDER BY a.fill_dt
     ) AS rn,
-    LAG(fill_dt) OVER (
-      PARTITION BY lvl1_acct_gid, eph_id, drug_cls, fill_year
-      ORDER BY fill_dt
-    ) AS prev_fill_dt,
-    LAG(day_sply_qty) OVER (
-      PARTITION BY lvl1_acct_gid, eph_id, drug_cls, fill_year
-      ORDER BY fill_dt
-    ) AS prev_day_sply_qty
-  FROM `project.dataset.fills`
-  WHERE fill_dt >= '2024-01-01'
-),
-
-calc AS (
-  -- Step 2: Compute net change in supply between fills
-  SELECT
-    lvl1_acct_gid,
-    eph_id,
-    drug_cls,
-    fill_year,
-    fill_dt,
-    day_sply_qty,
-    rn,
-    CASE
-      WHEN prev_fill_dt IS NULL THEN 0
-      ELSE (prev_day_sply_qty - DATE_DIFF(fill_dt, prev_fill_dt, DAY))
-    END AS net_excess_change
-  FROM fills_sorted
-),
-
--- Step 3: Recursive accumulation that resets to 0 when cumulative goes negative
-recursive_excess AS (
-  -- Base case: first fill in each group
-  SELECT
-    lvl1_acct_gid,
-    eph_id,
-    drug_cls,
-    fill_year,
-    fill_dt,
-    rn,
-    day_sply_qty,
-    net_excess_change,
-    GREATEST(net_excess_change, 0) AS running_excess
-  FROM calc
-  WHERE rn = 1
+    -- rolling coverage end after this fill
+    DATE_ADD(a.fill_dt, INTERVAL MAX(a.day_sply_qty) DAY) AS rolling_end,
+    0 AS excess_supply,           -- first fill → no excess
+    0 AS cumulative_excess        -- first fill → cumulative starts at 0
+  FROM `your_dataset.your_table_name` a
+  GROUP BY a.lv1_acct_id, a.eph_id, a.drug_cls, a.fill_year, a.fill_dt
+  QUALIFY rn = 1
 
   UNION ALL
 
-  -- Recursive case: accumulate from prior fill
+  ----------------------------------------------------------------
+  -- RECURSIVE STEP: process next fill per drug class
+  ----------------------------------------------------------------
   SELECT
-    c.lvl1_acct_gid,
-    c.eph_id,
-    c.drug_cls,
-    c.fill_year,
-    c.fill_dt,
-    c.rn,
-    c.day_sply_qty,
-    c.net_excess_change,
-    GREATEST(
-      r.running_excess + c.net_excess_change,
-      0
-    ) AS running_excess
-  FROM calc c
-  JOIN recursive_excess r
-    ON c.lvl1_acct_gid = r.lvl1_acct_gid
-    AND c.eph_id = r.eph_id
-    AND c.drug_cls = r.drug_cls
-    AND c.fill_year = r.fill_year
-    AND c.rn = r.rn + 1
+    b.lv1_acct_id,
+    b.eph_id,
+    b.drug_cls,
+    b.drug_name,
+    b.fill_year,
+    b.fill_dt,
+    b.day_sply_qty,
+    b.rn,
+
+    -- excess = new coverage beyond previous rolling_end
+    CASE
+      WHEN b.fill_dt > p.rolling_end THEN 0
+      ELSE GREATEST(
+        DATE_DIFF(DATE_ADD(b.fill_dt, INTERVAL b.day_sply_qty DAY), p.rolling_end, DAY),
+        0
+      )
+    END AS excess_supply,
+
+    -- update rolling_end: max of previous rolling_end vs current fill end
+    CASE
+      WHEN b.fill_dt > p.rolling_end THEN DATE_ADD(b.fill_dt, INTERVAL b.day_sply_qty DAY)
+      ELSE GREATEST(p.rolling_end, DATE_ADD(b.fill_dt, INTERVAL b.day_sply_qty DAY))
+    END AS rolling_end,
+
+    -- cumulative_excess: add current excess to previous cumulative; reset if gap
+    CASE
+      WHEN b.fill_dt > p.rolling_end THEN 0
+      ELSE p.cumulative_excess + GREATEST(
+             DATE_DIFF(DATE_ADD(b.fill_dt, INTERVAL b.day_sply_qty DAY), p.rolling_end, DAY),
+             0
+           )
+    END AS cumulative_excess
+
+  FROM recursive_calc p
+  JOIN (
+    SELECT
+      lv1_acct_id,
+      eph_id,
+      drug_cls,
+      ANY_VALUE(drug_name) AS drug_name,
+      fill_year,
+      fill_dt,
+      MAX(day_sply_qty) AS day_sply_qty,
+      ROW_NUMBER() OVER (
+        PARTITION BY lv1_acct_id, eph_id, drug_cls, fill_year
+        ORDER BY fill_dt
+      ) AS rn
+    FROM `your_dataset.your_table_name`
+    GROUP BY lv1_acct_id, eph_id, drug_cls, fill_year, fill_dt
+  ) AS b
+    ON b.lv1_acct_id = p.lv1_acct_id
+   AND b.eph_id = p.eph_id
+   AND b.drug_cls = p.drug_cls
+   AND b.fill_year = p.fill_year
+   AND b.rn = p.rn + 1
 )
 
+----------------------------------------------------------------
+-- FINAL OUTPUT
+----------------------------------------------------------------
 SELECT
-  lvl1_acct_gid,
+  lv1_acct_id,
   eph_id,
   drug_cls,
+  drug_name,
   fill_year,
   fill_dt,
   day_sply_qty,
-  running_excess AS excess_med_in_hand
-FROM recursive_excess
-ORDER BY lvl1_acct_gid, eph_id, drug_cls, fill_year, fill_dt;
+  excess_supply,
+  cumulative_excess,
+  rolling_end AS coverage_end_after_fill
+FROM recursive_calc
+ORDER BY lv1_acct_id, eph_id, drug_cls, fill_year, fill_dt;
