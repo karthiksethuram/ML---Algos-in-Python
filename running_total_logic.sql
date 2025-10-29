@@ -11,13 +11,13 @@ WITH RECURSIVE recursive_calc AS (
     ANY_VALUE(a.drug_name) AS drug_name,
     a.fill_year,
     a.fill_dt,
-    MAX(a.day_sply_qty) AS day_sply_qty,
+    CAST(MAX(a.day_sply_qty) AS INT64) AS day_sply_qty,
     ROW_NUMBER() OVER (
       PARTITION BY a.lv1_acct_id, a.eph_id, a.drug_cls, a.fill_year
       ORDER BY a.fill_dt
     ) AS rn,
     -- rolling coverage end after this fill
-    DATE_ADD(a.fill_dt, INTERVAL MAX(a.day_sply_qty) DAY) AS rolling_end,
+    DATE_ADD(a.fill_dt, INTERVAL CAST(MAX(a.day_sply_qty) AS INT64) DAY) AS rolling_end,
     0 AS excess_supply,           -- first fill → no excess
     0 AS cumulative_excess        -- first fill → cumulative starts at 0
   FROM `your_dataset.your_table_name` a
@@ -36,29 +36,29 @@ WITH RECURSIVE recursive_calc AS (
     b.drug_name,
     b.fill_year,
     b.fill_dt,
-    b.day_sply_qty,
+    CAST(b.day_sply_qty AS INT64) AS day_sply_qty,
     b.rn,
 
     -- excess = new coverage beyond previous rolling_end
     CASE
       WHEN b.fill_dt > p.rolling_end THEN 0
       ELSE GREATEST(
-        DATE_DIFF(DATE_ADD(b.fill_dt, INTERVAL b.day_sply_qty DAY), p.rolling_end, DAY),
+        DATE_DIFF(DATE_ADD(b.fill_dt, INTERVAL CAST(b.day_sply_qty AS INT64) DAY), p.rolling_end, DAY),
         0
       )
     END AS excess_supply,
 
     -- update rolling_end: max of previous rolling_end vs current fill end
     CASE
-      WHEN b.fill_dt > p.rolling_end THEN DATE_ADD(b.fill_dt, INTERVAL b.day_sply_qty DAY)
-      ELSE GREATEST(p.rolling_end, DATE_ADD(b.fill_dt, INTERVAL b.day_sply_qty DAY))
+      WHEN b.fill_dt > p.rolling_end THEN DATE_ADD(b.fill_dt, INTERVAL CAST(b.day_sply_qty AS INT64) DAY)
+      ELSE GREATEST(p.rolling_end, DATE_ADD(b.fill_dt, INTERVAL CAST(b.day_sply_qty AS INT64) DAY))
     END AS rolling_end,
 
     -- cumulative_excess: add current excess to previous cumulative; reset if gap
     CASE
       WHEN b.fill_dt > p.rolling_end THEN 0
       ELSE p.cumulative_excess + GREATEST(
-             DATE_DIFF(DATE_ADD(b.fill_dt, INTERVAL b.day_sply_qty DAY), p.rolling_end, DAY),
+             DATE_DIFF(DATE_ADD(b.fill_dt, INTERVAL CAST(b.day_sply_qty AS INT64) DAY), p.rolling_end, DAY),
              0
            )
     END AS cumulative_excess
@@ -72,7 +72,7 @@ WITH RECURSIVE recursive_calc AS (
       ANY_VALUE(drug_name) AS drug_name,
       fill_year,
       fill_dt,
-      MAX(day_sply_qty) AS day_sply_qty,
+      CAST(MAX(day_sply_qty) AS INT64) AS day_sply_qty,
       ROW_NUMBER() OVER (
         PARTITION BY lv1_acct_id, eph_id, drug_cls, fill_year
         ORDER BY fill_dt
