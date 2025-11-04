@@ -246,3 +246,93 @@ for x in key_exposures:
 # ---------------------------
 # plt.savefig("gee_marginal_effects_with_ci.png", dpi=200, bbox_inches='tight')
 
+import pandas as pd
+import numpy as np
+import statsmodels.api as sm
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# =====================================
+# 1️⃣ Load data (replace this with your actual)
+# =====================================
+# df = pd.read_csv("your_member_level_data.csv")
+# Expected columns: npi_id, is_target_member, presc_target_share, is_new_member, EDS_conversion_flag_150d
+
+# =====================================
+# 2️⃣ Aggregate to prescriber level
+# =====================================
+
+# Compute prescriber-level averages
+prescriber_df = (
+    df.groupby("npi_id")
+    .agg(
+        total_members=("EDS_conversion_flag_150d", "count"),
+        conversion_rate=("EDS_conversion_flag_150d", "mean"),
+        presc_target_share=("presc_target_share", "mean"),
+        pct_target_members=("is_target_member", "mean"),
+        pct_new_members=("is_new_member", "mean"),
+    )
+    .reset_index()
+)
+
+# =====================================
+# 3️⃣ Regression: ConversionRate_j ~ presc_target_share_j + controls
+# =====================================
+X = prescriber_df[["presc_target_share", "pct_target_members", "pct_new_members"]]
+X = sm.add_constant(X)
+y = prescriber_df["conversion_rate"]
+
+model = sm.OLS(y, X).fit(cov_type='HC3')  # robust SEs
+print(model.summary())
+
+# =====================================
+# 4️⃣ Quartile bucketing by exposure
+# =====================================
+prescriber_df["exposure_quartile"] = pd.qcut(prescriber_df["presc_target_share"], 4, labels=["Q1 (Low)", "Q2", "Q3", "Q4 (High)"])
+
+# Compute mean conversion rates by quartile
+quartile_summary = (
+    prescriber_df.groupby("exposure_quartile")
+    .agg(
+        mean_conversion_rate=("conversion_rate", "mean"),
+        mean_target_share=("presc_target_share", "mean"),
+        n_prescribers=("npi_id", "count"),
+    )
+    .reset_index()
+)
+
+print("\nQuartile Summary:")
+print(quartile_summary)
+
+# =====================================
+# 5️⃣ Visualization: Conversion rate by exposure quartile
+# =====================================
+plt.figure(figsize=(8,6))
+sns.barplot(
+    data=quartile_summary,
+    x="exposure_quartile",
+    y="mean_conversion_rate",
+    palette="coolwarm",
+)
+plt.title("Prescriber Conversion Rate by Target Exposure Quartile", fontsize=14)
+plt.xlabel("Prescriber Target Exposure Quartile", fontsize=12)
+plt.ylabel("Mean Conversion Rate (150 days)", fontsize=12)
+plt.grid(axis='y', alpha=0.3)
+plt.show()
+
+# =====================================
+# 6️⃣ (Optional) Trend line view — scatter + regression fit
+# =====================================
+plt.figure(figsize=(8,6))
+sns.regplot(
+    data=prescriber_df,
+    x="presc_target_share",
+    y="conversion_rate",
+    scatter_kws={"alpha": 0.5},
+    line_kws={"color": "red"},
+)
+plt.title("Prescriber Conversion Rate vs Prescriber Target Exposure", fontsize=14)
+plt.xlabel("Prescriber Target Share", fontsize=12)
+plt.ylabel("Conversion Rate (150 days)", fontsize=12)
+plt.grid(alpha=0.3)
+plt.show()
