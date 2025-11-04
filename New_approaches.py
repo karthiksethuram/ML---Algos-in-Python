@@ -6,6 +6,32 @@ import statsmodels.api as sm
 # Example: create prescriber_target_share
 df['prescriber_target_share'] = df.groupby('prescriber_id')['is_target'].transform('mean')
 
+
+# GEE with logit link (robust to singularities)
+import statsmodels.formula.api as smf
+from statsmodels.genmod.families import Binomial
+from statsmodels.genmod.cov_struct import Exchangeable
+
+gee_formula = """
+EDS_conversion_flag_150d ~ 
+    is_target_member + 
+    presc_target_share + 
+    is_target_member:presc_target_share + 
+    is_new_member
+"""
+
+gee_model = smf.gee(
+    formula=gee_formula,
+    groups="npi_id",
+    data=df,
+    cov_struct=Exchangeable(),
+    family=Binomial()
+)
+
+gee_result = gee_model.fit()
+print(gee_result.summary())
+
+
 # 1A: Linear mixed model (LMM) - if eds_conv is continuous or when using approximations
 # Formula: eds_conv ~ is_target + prescriber_target_share + is_target:prescriber_target_share + is_new_member + ...
 formula = "eds_conv ~ is_target + prescriber_target_share + is_target:prescriber_target_share + is_new_member + age + baseline_adherence"
