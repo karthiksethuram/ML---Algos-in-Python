@@ -252,87 +252,69 @@ import statsmodels.api as sm
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-# =====================================
-# 1️⃣ Load data (replace this with your actual)
-# =====================================
-# df = pd.read_csv("your_member_level_data.csv")
-# Expected columns: npi_id, is_target_member, presc_target_share, is_new_member, EDS_conversion_flag_150d
+import pandas as pd
+import numpy as np
+import statsmodels.api as sm
+import matplotlib.pyplot as plt
+import seaborn as sns
 
-# =====================================
-# 2️⃣ Aggregate to prescriber level
-# =====================================
+# --- STEP 1: Aggregate to prescriber level ---
 
-# Compute prescriber-level averages
+# df has: npi_id, EDS_conversion_flag_150d, presc_target_share, is_new_member, is_target_member
+
 prescriber_df = (
-    df.groupby("npi_id")
-    .agg(
-        total_members=("EDS_conversion_flag_150d", "count"),
-        conversion_rate=("EDS_conversion_flag_150d", "mean"),
-        presc_target_share=("presc_target_share", "mean"),
-        pct_target_members=("is_target_member", "mean"),
-        pct_new_members=("is_new_member", "mean"),
-    )
-    .reset_index()
+    df.groupby('npi_id', as_index=False)
+    .agg({
+        'EDS_conversion_flag_150d': 'mean',      # Conversion rate
+        'presc_target_share': 'mean',            # Avg exposure share
+        'is_new_member': 'mean',                 # % new members
+        'is_target_member': 'mean'               # % of members targeted
+    })
+    .rename(columns={'EDS_conversion_flag_150d': 'conversion_rate'})
 )
 
-# =====================================
-# 3️⃣ Regression: ConversionRate_j ~ presc_target_share_j + controls
-# =====================================
-X = prescriber_df[["presc_target_share", "pct_target_members", "pct_new_members"]]
-X = sm.add_constant(X)
-y = prescriber_df["conversion_rate"]
+# --- STEP 2: Ensure numeric types ---
+numeric_cols = ['conversion_rate', 'presc_target_share', 'is_new_member', 'is_target_member']
+prescriber_df[numeric_cols] = prescriber_df[numeric_cols].apply(pd.to_numeric, errors='coerce')
 
-model = sm.OLS(y, X).fit(cov_type='HC3')  # robust SEs
+# Drop rows with NaNs if any remain
+prescriber_df = prescriber_df.dropna(subset=numeric_cols)
+
+# --- STEP 3: Run regression ---
+y = prescriber_df['conversion_rate']
+X = prescriber_df[['presc_target_share', 'is_new_member', 'is_target_member']]
+
+# Add constant for intercept
+X = sm.add_constant(X)
+
+model = sm.OLS(y, X).fit()
 print(model.summary())
 
-# =====================================
-# 4️⃣ Quartile bucketing by exposure
-# =====================================
-prescriber_df["exposure_quartile"] = pd.qcut(prescriber_df["presc_target_share"], 4, labels=["Q1 (Low)", "Q2", "Q3", "Q4 (High)"])
+# --- STEP 4: Bucket prescribers into quartiles by exposure ---
+prescriber_df['exposure_quartile'] = pd.qcut(prescriber_df['presc_target_share'], 4, labels=['Q1','Q2','Q3','Q4'])
 
-# Compute mean conversion rates by quartile
 quartile_summary = (
-    prescriber_df.groupby("exposure_quartile")
-    .agg(
-        mean_conversion_rate=("conversion_rate", "mean"),
-        mean_target_share=("presc_target_share", "mean"),
-        n_prescribers=("npi_id", "count"),
-    )
+    prescriber_df.groupby('exposure_quartile', observed=False)['conversion_rate']
+    .mean()
     .reset_index()
 )
 
-print("\nQuartile Summary:")
+print("\nAverage Conversion Rate by Prescriber Exposure Quartile:")
 print(quartile_summary)
 
-# =====================================
-# 5️⃣ Visualization: Conversion rate by exposure quartile
-# =====================================
-plt.figure(figsize=(8,6))
-sns.barplot(
+# --- STEP 5: Visualize trends ---
+plt.figure(figsize=(8,5))
+sns.lineplot(
     data=quartile_summary,
-    x="exposure_quartile",
-    y="mean_conversion_rate",
-    palette="coolwarm",
+    x='exposure_quartile',
+    y='conversion_rate',
+    marker='o',
+    linewidth=2,
 )
-plt.title("Prescriber Conversion Rate by Target Exposure Quartile", fontsize=14)
-plt.xlabel("Prescriber Target Exposure Quartile", fontsize=12)
-plt.ylabel("Mean Conversion Rate (150 days)", fontsize=12)
-plt.grid(axis='y', alpha=0.3)
+plt.title('Conversion Rate vs. Prescriber Target Exposure Quartile')
+plt.xlabel('Prescriber Target Exposure Quartile')
+plt.ylabel('Average Conversion Rate')
+plt.grid(True)
+plt.tight_layout()
 plt.show()
 
-# =====================================
-# 6️⃣ (Optional) Trend line view — scatter + regression fit
-# =====================================
-plt.figure(figsize=(8,6))
-sns.regplot(
-    data=prescriber_df,
-    x="presc_target_share",
-    y="conversion_rate",
-    scatter_kws={"alpha": 0.5},
-    line_kws={"color": "red"},
-)
-plt.title("Prescriber Conversion Rate vs Prescriber Target Exposure", fontsize=14)
-plt.xlabel("Prescriber Target Share", fontsize=12)
-plt.ylabel("Conversion Rate (150 days)", fontsize=12)
-plt.grid(alpha=0.3)
-plt.show()
