@@ -1,158 +1,29 @@
-🧮 Step 1. Coefficient summary (from your GEE)
-Variable	Coefficient	p-value	Interpretation
-Intercept	1.30	0.00	Baseline log-odds of conversion for a control member with average prescriber share and not new.
-is_target_member	+0.22	0.00	Direct effect of being targeted (vs control), when prescriber’s target share = 0.
-presc_target_share	+0.156	0.034	Spillover effect: control members convert more when their prescriber has more targeted patients.
-is_target_member × presc_target_share	–0.375	0.00	Interaction: effect of being targeted shrinks (or even reverses) as prescriber’s exposure increases.
-is_new_member	+0.298	0.00	New members are more likely to convert overall.
-🔍 Step 2. Expressed in human terms
+# aggregate to prescriber level
+pres = df.groupby('npi_id').agg(
+    total_members=('EDS_conversion_flag_150d','count'),
+    conversion_rate=('EDS_conversion_flag_150d','mean'),
+    presc_target_share=('presc_target_share','mean'),
+    pct_new=('is_new_member','mean'),
+    pct_target=('is_target_member','mean')
+).reset_index()
 
-Let’s define:
+import statsmodels.api as sm
+X = pres[['presc_target_share','pct_new','pct_target']]
+X = sm.add_constant(X)
+y = pres['conversion_rate']
 
-𝑇
-𝑖
-=
-1
-T
-i
-	​
+# Use WLS weighted by number of members (more precise prescribers get more weight)
+wls = sm.WLS(y, X, weights=pres['total_members']).fit(cov_type='HC3')
+print(wls.summary())
 
-=1 if member is targeted.
+# Relationship of presc_target_share noise vs size
+import matplotlib.pyplot as plt
+import seaborn as sns
 
-𝑆
-𝑗
-S
-j
-	​
-
- = prescriber’s target share (between 0–1).
-
-𝑌
-=
-Y= log-odds(EDS conversion).
-
-Then your model implies:
-
-logit
-(
-𝑃
-(
-convert
-)
-)
-=
-1.30
-+
-0.22
-𝑇
-+
-0.156
-𝑆
-−
-0.375
-(
-𝑇
-×
-𝑆
-)
-+
-0.298
-(
-new member
-)
-logit(P(convert))=1.30+0.22T+0.156S−0.375(T×S)+0.298(new member)
-✅ For a control member (T = 0)
-logit
-(
-𝑃
-)
-=
-1.30
-+
-0.156
-𝑆
-+
-0.298
-(
-new
-)
-logit(P)=1.30+0.156S+0.298(new)
-
-→ Control members benefit modestly when prescriber has more targeted patients — this is the spillover effect (prescribers change behavior even for control patients).
-
-✅ For a targeted member (T = 1)
-logit
-(
-𝑃
-)
-=
-1.30
-+
-(
-0.22
-)
-+
-(
-0.156
-−
-0.375
-)
-𝑆
-+
-0.298
-(
-new
-)
-logit(P)=1.30+(0.22)+(0.156−0.375)S+0.298(new)
-logit
-(
-𝑃
-)
-=
-1.52
-−
-0.219
-𝑆
-+
-0.298
-(
-new
-)
-logit(P)=1.52−0.219S+0.298(new)
-
-So as 
-𝑆
-S (prescriber exposure) increases, the incremental benefit of targeting that member declines.
-
-🧠 Step 3. Why does the negative interaction make sense (statistically and behaviorally)?
-
-This is one of the most common findings in partial interference experiments — and it’s actually interpretable if you think of diminishing marginal returns.
-
-Possible real-world explanations:
-
-Prescriber-level saturation / ceiling effect
-When many of a prescriber’s patients are targeted, that prescriber has already changed behavior — so targeting another member under that prescriber yields less additional lift.
-→ The marginal impact of “member being targeted” goes down as prescriber’s exposure increases.
-
-Indirect spillover already covers most of the benefit
-High prescriber exposure → control members get improved outcomes (the +0.156).
-That means the “gap” between targeted vs control members narrows, producing a negative interaction.
-
-Campaign overlap
-Prescribers with high target shares might receive many EHR alerts or messages — after a certain saturation, alerts may be ignored, reducing incremental impact.
-
-Statistical perspective
-Interaction term captures how the slope of is_target_member changes with prescriber_share.
-If prescriber_share and is_target_member are correlated (common, because many members share same prescriber), the negative sign may partly reflect this collinearity — essentially the model “shares credit” between the spillover and direct effects.
-
-📈 Step 4. Quantify with example probabilities
-
-Let’s estimate approximate predicted probabilities (assuming is_new_member = 0, for clarity):
-
-presc_target_share	Control (T=0)	Targeted (T=1)	Lift (Δ)
-0.0	logit⁻¹(1.30) = 0.79	logit⁻¹(1.52) = 0.82	+3%
-0.5	logit⁻¹(1.30+0.156×0.5)=0.81	logit⁻¹(1.52-0.219×0.5)=0.81	0%
-1.0	logit⁻¹(1.30+0.156)=0.81	logit⁻¹(1.52-0.219)=0.80	-1%
-
-➡️ So when prescriber exposure is low (few of their patients targeted), targeting helps (+3%).
-When prescriber exposure is high, everyone benefits a bit (spillover), but direct targeting adds no extra effect — consistent with saturation.
+# variability of share by total_members
+share_by_size = df.groupby('npi_id').agg(total_members=('EDS_conversion_flag_150d','count'),
+                                          presc_target_share=('presc_target_share','mean'))
+sns.scatterplot(data=share_by_size, x='total_members', y='presc_target_share', alpha=0.6)
+plt.xscale('log')
+plt.title("Presc target share vs prescriber size (log x)")
+plt.show()
