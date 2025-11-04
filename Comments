@@ -1,0 +1,176 @@
+🔍 Restating the Problem
+
+Randomization: Done at member level, not prescriber level.
+
+Reality: Prescribers treat multiple members (both target and control), so the treatment “spills over.”
+
+Outcome: Mixed or counterintuitive results at member level, because members share the same prescriber environment.
+
+KPI: EDS (eligible days supply) conversion within 150 days of outreach.
+
+🎯 The Core Issue
+
+Your randomization unit (member) ≠ your exposure unit (prescriber).
+→ Interference / Spillover across members within prescribers.
+
+If even a small fraction of a prescriber’s patients were targeted, that prescriber may change behavior for all their patients — biasing your estimated treatment effect toward zero or even reversing signs depending on exposure mix.
+
+🔬 Frameworks to Fix / Reinterpret Results
+1. Reframe the Analysis to a “Cluster Exposure” Framework
+
+Treat prescribers as clusters, and model degree of exposure rather than binary treatment.
+
+Variables:
+
+prescriber_target_share: % of that prescriber’s patients who were targeted.
+
+is_target: whether this specific member was targeted.
+
+control covariates: new member, adherence history, etc.
+
+You can then run:
+
+𝐸
+𝐷
+𝑆
+_
+𝑐
+𝑜
+𝑛
+𝑣
+𝑖
+𝑗
+=
+𝛽
+0
++
+𝛽
+1
+is_target
+𝑖
+𝑗
++
+𝛽
+2
+prescriber_target_share
+𝑗
++
+𝛽
+3
+(
+is_target
+𝑖
+𝑗
+×
+prescriber_target_share
+𝑗
+)
++
+covariates
++
+𝑢
+𝑗
++
+𝜖
+𝑖
+𝑗
+EDS_conv
+ij
+	​
+
+=β
+0
+	​
+
++β
+1
+	​
+
+is_target
+ij
+	​
+
++β
+2
+	​
+
+prescriber_target_share
+j
+	​
+
++β
+3
+	​
+
+(is_target
+ij
+	​
+
+×prescriber_target_share
+j
+	​
+
+)+covariates+u
+j
+	​
+
++ϵ
+ij
+	​
+
+
+Where 
+𝑢
+𝑗
+u
+j
+	​
+
+ is a random effect at prescriber level (mixed model).
+
+➡️ Interpretation:
+
+β₁ → direct member-level effect of being targeted
+
+β₂ → spillover effect from prescriber exposure
+
+β₃ → whether direct impact changes with prescriber exposure
+
+📍Use: statsmodels.MixedLM in Python or lme4::lmer() in R.
+
+2. Aggregate to Prescriber Level
+
+If you suspect strong spillover, aggregate members’ outcomes to the prescriber level:
+
+ConversionRate
+𝑗
+=
+𝛼
++
+𝛾
+⋅
+prescriber_target_share
+𝑗
++
+controls
++
+𝜖
+𝑗
+ConversionRate
+j
+	​
+
+=α+γ⋅prescriber_target_share
+j
+	​
+
++controls+ϵ
+j
+	​
+
+
+Then analyze how conversion rates move with prescriber exposure levels.
+
+➡️ You can bucket prescribers into quartiles by exposure and visualize trends.
+
+This avoids contamination across members within a prescriber.
