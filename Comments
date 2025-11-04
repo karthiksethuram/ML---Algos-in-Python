@@ -1,176 +1,158 @@
-🔍 Restating the Problem
+🧮 Step 1. Coefficient summary (from your GEE)
+Variable	Coefficient	p-value	Interpretation
+Intercept	1.30	0.00	Baseline log-odds of conversion for a control member with average prescriber share and not new.
+is_target_member	+0.22	0.00	Direct effect of being targeted (vs control), when prescriber’s target share = 0.
+presc_target_share	+0.156	0.034	Spillover effect: control members convert more when their prescriber has more targeted patients.
+is_target_member × presc_target_share	–0.375	0.00	Interaction: effect of being targeted shrinks (or even reverses) as prescriber’s exposure increases.
+is_new_member	+0.298	0.00	New members are more likely to convert overall.
+🔍 Step 2. Expressed in human terms
 
-Randomization: Done at member level, not prescriber level.
+Let’s define:
 
-Reality: Prescribers treat multiple members (both target and control), so the treatment “spills over.”
-
-Outcome: Mixed or counterintuitive results at member level, because members share the same prescriber environment.
-
-KPI: EDS (eligible days supply) conversion within 150 days of outreach.
-
-🎯 The Core Issue
-
-Your randomization unit (member) ≠ your exposure unit (prescriber).
-→ Interference / Spillover across members within prescribers.
-
-If even a small fraction of a prescriber’s patients were targeted, that prescriber may change behavior for all their patients — biasing your estimated treatment effect toward zero or even reversing signs depending on exposure mix.
-
-🔬 Frameworks to Fix / Reinterpret Results
-1. Reframe the Analysis to a “Cluster Exposure” Framework
-
-Treat prescribers as clusters, and model degree of exposure rather than binary treatment.
-
-Variables:
-
-prescriber_target_share: % of that prescriber’s patients who were targeted.
-
-is_target: whether this specific member was targeted.
-
-control covariates: new member, adherence history, etc.
-
-You can then run:
-
-𝐸
-𝐷
-𝑆
-_
-𝑐
-𝑜
-𝑛
-𝑣
+𝑇
 𝑖
-𝑗
 =
-𝛽
-0
-+
-𝛽
 1
-is_target
-𝑖
+T
+i
+	​
+
+=1 if member is targeted.
+
+𝑆
 𝑗
-+
-𝛽
-2
-prescriber_target_share
-𝑗
-+
-𝛽
-3
+S
+j
+	​
+
+ = prescriber’s target share (between 0–1).
+
+𝑌
+=
+Y= log-odds(EDS conversion).
+
+Then your model implies:
+
+logit
 (
-is_target
-𝑖
-𝑗
+𝑃
+(
+convert
+)
+)
+=
+1.30
++
+0.22
+𝑇
++
+0.156
+𝑆
+−
+0.375
+(
+𝑇
 ×
-prescriber_target_share
-𝑗
+𝑆
 )
 +
-covariates
-+
-𝑢
-𝑗
-+
-𝜖
-𝑖
-𝑗
-EDS_conv
-ij
-	​
-
-=β
-0
-	​
-
-+β
-1
-	​
-
-is_target
-ij
-	​
-
-+β
-2
-	​
-
-prescriber_target_share
-j
-	​
-
-+β
-3
-	​
-
-(is_target
-ij
-	​
-
-×prescriber_target_share
-j
-	​
-
-)+covariates+u
-j
-	​
-
-+ϵ
-ij
-	​
-
-
-Where 
-𝑢
-𝑗
-u
-j
-	​
-
- is a random effect at prescriber level (mixed model).
-
-➡️ Interpretation:
-
-β₁ → direct member-level effect of being targeted
-
-β₂ → spillover effect from prescriber exposure
-
-β₃ → whether direct impact changes with prescriber exposure
-
-📍Use: statsmodels.MixedLM in Python or lme4::lmer() in R.
-
-2. Aggregate to Prescriber Level
-
-If you suspect strong spillover, aggregate members’ outcomes to the prescriber level:
-
-ConversionRate
-𝑗
+0.298
+(
+new member
+)
+logit(P(convert))=1.30+0.22T+0.156S−0.375(T×S)+0.298(new member)
+✅ For a control member (T = 0)
+logit
+(
+𝑃
+)
 =
-𝛼
+1.30
 +
-𝛾
-⋅
-prescriber_target_share
-𝑗
+0.156
+𝑆
 +
-controls
+0.298
+(
+new
+)
+logit(P)=1.30+0.156S+0.298(new)
+
+→ Control members benefit modestly when prescriber has more targeted patients — this is the spillover effect (prescribers change behavior even for control patients).
+
+✅ For a targeted member (T = 1)
+logit
+(
+𝑃
+)
+=
+1.30
 +
-𝜖
-𝑗
-ConversionRate
-j
-	​
+(
+0.22
+)
++
+(
+0.156
+−
+0.375
+)
+𝑆
++
+0.298
+(
+new
+)
+logit(P)=1.30+(0.22)+(0.156−0.375)S+0.298(new)
+logit
+(
+𝑃
+)
+=
+1.52
+−
+0.219
+𝑆
++
+0.298
+(
+new
+)
+logit(P)=1.52−0.219S+0.298(new)
 
-=α+γ⋅prescriber_target_share
-j
-	​
+So as 
+𝑆
+S (prescriber exposure) increases, the incremental benefit of targeting that member declines.
 
-+controls+ϵ
-j
-	​
+🧠 Step 3. Why does the negative interaction make sense (statistically and behaviorally)?
 
+This is one of the most common findings in partial interference experiments — and it’s actually interpretable if you think of diminishing marginal returns.
 
-Then analyze how conversion rates move with prescriber exposure levels.
+Possible real-world explanations:
 
-➡️ You can bucket prescribers into quartiles by exposure and visualize trends.
+Prescriber-level saturation / ceiling effect
+When many of a prescriber’s patients are targeted, that prescriber has already changed behavior — so targeting another member under that prescriber yields less additional lift.
+→ The marginal impact of “member being targeted” goes down as prescriber’s exposure increases.
 
-This avoids contamination across members within a prescriber.
+Indirect spillover already covers most of the benefit
+High prescriber exposure → control members get improved outcomes (the +0.156).
+That means the “gap” between targeted vs control members narrows, producing a negative interaction.
+
+Campaign overlap
+Prescribers with high target shares might receive many EHR alerts or messages — after a certain saturation, alerts may be ignored, reducing incremental impact.
+
+Statistical perspective
+Interaction term captures how the slope of is_target_member changes with prescriber_share.
+If prescriber_share and is_target_member are correlated (common, because many members share same prescriber), the negative sign may partly reflect this collinearity — essentially the model “shares credit” between the spillover and direct effects.
+
+📈 Step 4. Quantify with example probabilities
+
+Let’s estimate approximate predicted probabilities (assuming is_new_member = 0, for clarity):
+
+presc_target_share	Control (T=0)	Targeted (T=1)	Lift (Δ)
+0.0	logit⁻¹(1.30) = 0.79	logit⁻¹(1.52) = 0.82	+3%
+0.5	logit⁻¹(1.30+0.156×0.5)=0.81	logit⁻¹(1.52-0.219×0.5)=0.81	0%
+1.0	logit⁻¹(1.30+0.156)=0.81	logit⁻¹(1.52-0.219)=0.80	-1%
+
+➡️ So when prescriber exposure is low (few of their patients targeted), targeting helps (+3%).
+When prescriber exposure is high, everyone benefits a bit (spillover), but direct targeting adds no extra effect — consistent with saturation.
