@@ -1,44 +1,54 @@
 import statsmodels.formula.api as smf
+import statsmodels.api as sm
 import pandas as pd
 import numpy as np
 
-# Binning exposure for spillover / saturation tests
+# Create exposure bins
 df = df.copy()
 bins = [0, 0.2, 0.4, 0.6, 0.8, 1.01]
 labels = ["0-20%", "20-40%", "40-60%", "60-80%", "80-100%"]
 df['share_bin'] = pd.cut(df['presc_target_share'], bins=bins, labels=labels, include_lowest=True)
 
-# 1️⃣ Spillover test: only control group
+#################################################
+# 1️⃣ Spillover Test — Control only
+#################################################
 spill_model = smf.glm(
-    "EDS_conversion_flag_150d ~ presc_target_share + is_new_member",
+    formula="EDS_conversion_flag_150d ~ presc_target_share + is_new_member",
     data=df[df.is_target_member == 0],
-    family=smf.families.Binomial()
-).fit(cov_type='HC3')  # robust covariance
+    family=sm.families.Binomial()
+).fit(cov_type='HC3')
 
 print("\n=== Spillover Effect (Control Only) ===")
 print(spill_model.summary())
 
-# 2️⃣ Diminishing returns test: full sample w/ interaction + quadratic
+
+#################################################
+# 2️⃣ Diminishing Returns (Saturation) Test
+#################################################
 diminish_model = smf.glm(
-    """EDS_conversion_flag_150d ~ 
-        is_target_member +
-        presc_target_share +
-        I(presc_target_share**2) +
-        is_target_member:presc_target_share +
-        is_new_member
+    formula="""
+        EDS_conversion_flag_150d ~ 
+            is_target_member +
+            presc_target_share +
+            I(presc_target_share**2) +
+            is_target_member:presc_target_share +
+            is_new_member
     """,
     data=df,
-    family=smf.families.Binomial()
+    family=sm.families.Binomial()
 ).fit(cov_type='HC3')
 
 print("\n=== Diminishing Returns (Saturation Test) ===")
 print(diminish_model.summary())
 
-# 3️⃣ Average Intent-To-Treat (ITT) effect: difference overall
+
+#################################################
+# 3️⃣ Overall Outreach Effect (Average ITT)
+#################################################
 itt_model = smf.glm(
-    "EDS_conversion_flag_150d ~ is_target_member + is_new_member",
+    formula="EDS_conversion_flag_150d ~ is_target_member + is_new_member",
     data=df,
-    family=smf.families.Binomial()
+    family=sm.families.Binomial()
 ).fit(cov_type='HC3')
 
 print("\n=== Average Outreach Effect (ITT) ===")
