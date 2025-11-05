@@ -1,55 +1,45 @@
-# Required packages
-import numpy as np
-import pandas as pd
-import statsmodels.api as sm
 import statsmodels.formula.api as smf
-from statsmodels.stats.proportion import proportion_confint
-from statsmodels.genmod.families import Binomial
-from statsmodels.genmod.cov_struct import Exchangeable
-from patsy import dmatrix
-from math import sqrt
-import matplotlib.pyplot as plt
-import warnings
-warnings.filterwarnings("ignore")
+import pandas as pd
+import numpy as np
 
-# -------------------------
-# 0. Prepare dataframe
-# -------------------------
-# Replace this with your actual df load if needed.
-# df = pd.read_csv("your_data.csv")
+# Binning exposure for spillover / saturation tests
+df = df.copy()
+bins = [0, 0.2, 0.4, 0.6, 0.8, 1.01]
+labels = ["0-20%", "20-40%", "40-60%", "60-80%", "80-100%"]
+df['share_bin'] = pd.cut(df['presc_target_share'], bins=bins, labels=labels, include_lowest=True)
 
-# Ensure required columns exist
-required = ['member_id','npi_id','is_target_member','EDS_conversion_flag_150d']
-for c in required:
-    if c not in df.columns:
-        raise ValueError(f"Missing required column: {c}")
+# 1️⃣ Spillover test: only control group
+spill_model = smf.glm(
+    "EDS_conversion_flag_150d ~ presc_target_share + is_new_member",
+    data=df[df.is_target_member == 0],
+    family=smf.families.Binomial()
+).fit(cov_type='HC3')  # robust covariance
 
-# 0.a Compute leave-one-out prescriber share if not present
-if 'presc_target_share_excl_self' not in df.columns:
-    presc_counts = df.groupby('npi_id')['is_target_member'].sum().rename('presc_treated_count')
-    presc_total = df.groupby('npi_id')['member_id'].count().rename('presc_total_count')
-    presc_df = pd.concat([presc_counts, presc_total], axis=1).reset_index()
-    df = df.merge(presc_df, on='npi_id', how='left')
-    df['presc_treated_excl'] = df['presc_treated_count'] - df['is_target_member']
-    df['presc_total_excl'] = df['presc_total_count'] - 1
-    df['presc_target_share_excl_self'] = df['presc_treated_excl'] / df['presc_total_excl'].replace(0, np.nan)
-    # replace NaN (single-member prescribers) with 0 or keep NaN depending on your preference:
-    df['presc_target_share_excl_self'] = df['presc_target_share_excl_self'].fillna(0)
-# Filter controls
-ctrl = df[df['is_target_member'] == 0].copy()
-ctrl['presc_share_c'] = ctrl['presc_target_share_excl_self'] - ctrl['presc_target_share_excl_self'].mean()
+print("\n=== Spillover Effect (Control Only) ===")
+print(spill_model.summary())
 
-# GLM on controls: conversion ~ prescriber share + covariates
-formula_ctrl = "EDS_conversion_flag_150d ~ presc_share_c + is_new_member"
-glm_ctrl = smf.glm(formula=formula_ctrl, data=ctrl, family=sm.families.Binomial()).fit()
-ctrl_clustered = glm_ctrl.get_robustcov_results(cov_type='cluster', groups=ctrl['npi_id'])
+# 2️⃣ Diminishing returns test: full sample w/ interaction + quadratic
+diminish_model = smf.glm(
+    """EDS_conversion_flag_150d ~ 
+        is_target_member +
+        presc_target_share +
+        I(presc_target_share**2) +
+        is_target_member:presc_target_share +
+        is_new_member
+    """,
+    data=df,
+    family=smf.families.Binomial()
+).fit(cov_type='HC3')
 
-print("Controls-only GLM (cluster-robust SEs):")
-print(ctrl_clustered.summary())
+print("\n=== Diminishing Returns (Saturation Test) ===")
+print(diminish_model.summary())
 
-coef = ctrl_clustered.params['presc_share_c']
-# approximate average marginal effect at mean p
-p_mean = ctrl['EDS_conversion_flag_150d'].mean()
-marginal_effect = coef * p_mean * (1 - p_mean)  # delta method rough approx for small coef
-print("Approx marginal effect of +1 unit share (0-1) on prob scale:", marginal_effect)
-print("Or effect of +10 pp (0.10):", marginal_effect * 0.10)
+# 3️⃣ Average Intent-To-Treat (ITT) effect: difference overall
+itt_model = smf.glm(
+    "EDS_conversion_flag_150d ~ is_target_member + is_new_member",
+    data=df,
+    family=smf.families.Binomial()
+).fit(cov_type='HC3')
+
+print("\n=== Average Outreach Effect (ITT) ===")
+print(itt_model.summary())
