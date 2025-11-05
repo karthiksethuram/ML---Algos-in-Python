@@ -1,230 +1,44 @@
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
-import statsmodels.api as sm
-import statsmodels.formula.api as smf
+# compute presc_share_excl_self
+# df has columns: npi_id, member_id, is_target_member (0/1)
+presc_counts = df.groupby('npi_id')['is_target_member'].sum().rename('presc_treated_count')
+presc_total = df.groupby('npi_id')['member_id'].count().rename('presc_total_count')
+presc_df = pd.concat([presc_counts, presc_total], axis=1).reset_index()
+
+df = df.merge(presc_df, on='npi_id', how='left')
+# leave-one-out numerator and denominator
+df['presc_treated_excl'] = df['presc_treated_count'] - df['is_target_member']
+df['presc_total_excl'] = df['presc_total_count'] - 1
+# avoid divide-by-zero
+df['presc_target_share_excl_self'] = df['presc_treated_excl'] / df['presc_total_excl'].replace(0, np.nan)
+
+
+df['bin'] = pd.cut(df['presc_target_share_excl_self'], bins=np.linspace(0,1,11))
+summary = (df.groupby(['bin','is_target_member'])
+             .agg(n_members=('member_id','count'),
+                  n_prescribers=('npi_id', lambda x: x.nunique()),
+                  conv_rate=('EDS_conversion_flag_150d', 'mean'))
+             .reset_index())
+print(summary)
+
+
+df['presc_share_c'] = df['presc_target_share_excl_self'] - df['presc_target_share_excl_self'].mean()
+gee_formula = "EDS_conversion_flag_150d ~ is_target_member + presc_share_c + is_target_member:presc_share_c + is_new_member"
+gee_model = smf.gee(formula=gee_formula, groups="npi_id", data=df,
+                   cov_struct=Exchangeable(), family=Binomial())
+gee_result = gee_model.fit()
+print(gee_result.summary())
+
+
 from patsy import dmatrix
+df['spline_share_1'] = dmatrix("bs(presc_share_c, df=4, include_intercept=False)",
+                               data=df, return_type='dataframe')
+# or simply include bin dummies from step 2
 
-# --------------------
-# Replace with your df load if needed
-# df = pd.read_csv("your_data.csv")
-# expected columns: npi_id, is_target_member (0/1), presc_target_share (0-1), is_new_member (0/1), EDS_conversion_flag_150d (0/1)
-# --------------------
+# R example with fixed effects
+library(lmtest)
+library(sandwich)
+model_fe <- glm(EDS_conversion_flag_150d ~ is_target_member*presc_share_excl_self + is_new_member + factor(npi_id),
+                family=binomial(), data=df)
+# cluster-robust SE by npi_id
+coeftest(model_fe, vcov = vcovCL, cluster = ~npi_id)
 
-# Quick sanity types
-df['presc_target_share'] = pd.to_numeric(df['presc_target_share'], errors='coerce')
-df = df.dropna(subset=['npi_id','is_target_member','presc_target_share','EDS_conversion_flag_150d'])
-
-# --------------------
-# 0) Data density / leverage diagnostics
-# --------------------
-# counts of members by prescriber_share bins, and counts of targeted members in each bin
-bins = np.linspace(0, 1, 11)
-df['share_bin'] = pd.cut(df['presc_target_share'], bins=bins, include_lowest=True)
-density = df.groupby('share_bin').agg(
-    total_members=('npi_id','count'),
-    targeted_members=('is_target_member','sum'),
-    conversion_rate=('EDS_conversion_flag_150d','mean')
-).reset_index()
-
-print("Density by prescriber_target_share bin:")
-print(density)
-
-# plot counts
-plt.figure(figsize=(8,3))
-sns.barplot(x=density['share_bin'].astype(str), y=density['total_members'])
-plt.xticks(rotation=45)
-plt.title("Member counts by prescriber_target_share bin")
-plt.tight_layout()
-plt.show()
-
-# See targeted proportion by share bin
-plt.figure(figsize=(8,3))
-sns.barplot(x=density['share_bin'].astype(str), y=density['targeted_members'])
-plt.xticks(rotation=45)
-plt.title("Number of targeted members by prescriber_target_share bin")
-plt.tight_layout()
-plt.show()
-
-# --------------------
-# Helper: function to compute predicted probs and CIs for a fitted GEE-like result
-# We'll reuse the delta method as in earlier code.
-# --------------------
-def predict_with_ci(result, pred_df, param_order=None):
-    # result: fitted model (GEE). result.params indexed by names
-    # pred_df: dataframe containing columns matching model terms (Intercept or constructed X_data)
-    # param_order: list of parameter names in the same order as result.params.index; if None, use result.params.index
-    param_names = result.params.index.tolist() if param_order is None else list(param_order)
-    # Build design X matrix aligned to param_names
-    # Use patsy to create design info if model was built from formula; but here we'll create columns matching param names
-    X = pd.DataFrame(index=pred_df.index, columns=param_names, dtype=float)
-    # intercept if present
-    if 'Intercept' in param_names:
-        X['Intercept'] = 1.0
-    # fill simple names if present
-    for col in ['is_target_member','presc_target_share','is_new_member']:
-        if col in param_names and col in pred_df.columns:
-            X[col] = pred_df[col].astype(float)
-    # interactions present in param_names like 'is_target_member:presc_target_share' or 'is_target_member*presc_target_share'
-    for pname in param_names:
-        if ':' in pname or '*' in pname:
-            # create interaction by splitting on common separators
-            sep = ':' if ':' in pname else '*'
-            parts = pname.split(sep)
-            # if both parts present in pred_df, multiply them
-            if all(part in pred_df.columns for part in parts):
-                X[pname] = pred_df[parts[0]].astype(float)
-                for part in parts[1:]:
-                    X[pname] = X[pname] * pred_df[part].astype(float)
-    # For any columns still missing (e.g., spline basis names), try to pull from pred_df directly
-    for c in X.columns:
-        if X[c].isnull().all() and c in pred_df.columns:
-            X[c] = pred_df[c].astype(float)
-
-    X = X.fillna(0.0)
-    X_mat = X.values
-    params = result.params.values.reshape(-1,1)
-    covb = result.cov_params().values
-    lp = X_mat.dot(params).flatten()
-    se2 = np.einsum('ij,jk,ik->i', X_mat, covb, X_mat)
-    se = np.sqrt(np.maximum(se2, 0))
-    z = 1.96
-    lp_low = lp - z*se
-    lp_high = lp + z*se
-    prob = 1.0/(1.0+np.exp(-lp))
-    prob_low = 1.0/(1.0+np.exp(-lp_low))
-    prob_high = 1.0/(1.0+np.exp(-lp_high))
-    out = pred_df.copy().reset_index(drop=True)
-    out['pred_prob'] = prob
-    out['prob_low'] = prob_low
-    out['prob_high'] = prob_high
-    return out
-
-# --------------------
-# 1) Fit original linear interaction GEE (for reference)
-# --------------------
-formula_lin = "EDS_conversion_flag_150d ~ is_target_member + presc_target_share + is_target_member:presc_target_share + is_new_member"
-gee_lin = smf.gee(formula_lin, groups="npi_id", data=df, family=sm.families.Binomial(), cov_struct=sm.cov_struct.Exchangeable())
-res_lin = gee_lin.fit()
-print(res_lin.summary())
-
-# --------------------
-# 2) Quadratic model: add presc_target_share^2 and its interaction with is_target_member
-# --------------------
-df['presc_target_share_sq'] = df['presc_target_share']**2
-formula_quad = ("EDS_conversion_flag_150d ~ is_target_member + presc_target_share + presc_target_share_sq + "
-                "is_target_member:presc_target_share + is_target_member:presc_target_share_sq + is_new_member")
-gee_quad = smf.gee(formula_quad, groups="npi_id", data=df, family=sm.families.Binomial(), cov_struct=sm.cov_struct.Exchangeable())
-res_quad = gee_quad.fit()
-print(res_quad.summary())
-
-# --------------------
-# 3) Spline model (natural cubic spline or bs) using patsy dmatrix for presc_target_share
-#    Here we create 3 knots at tertiles (you can change)
-# --------------------
-# compute knot locations at tertiles of observed presc_target_share
-knots = list(df['presc_target_share'].quantile([0.25, 0.5, 0.75]).values)
-# build spline basis (3 degrees of freedom + intercept handling)
-spline_basis = dmatrix("bs(presc_target_share, knots=knots, degree=3, include_intercept=False)",
-                       {"presc_target_share": df['presc_target_share']}, return_type='dataframe')
-# rename spline columns to safe names
-spline_basis.columns = [f"spline_{i}" for i in range(spline_basis.shape[1])]
-df_spline = pd.concat([df.reset_index(drop=True), spline_basis.reset_index(drop=True)], axis=1)
-
-# Build formula with spline terms and interactions with is_target_member
-spline_terms = " + ".join(spline_basis.columns)
-# interactions
-inter_terms = " + ".join([f"is_target_member:{c}" for c in spline_basis.columns])
-formula_spline = f"EDS_conversion_flag_150d ~ is_target_member + {spline_terms} + {inter_terms} + is_new_member"
-gee_spline = smf.gee(formula_spline, groups="npi_id", data=df_spline, family=sm.families.Binomial(), cov_struct=sm.cov_struct.Exchangeable())
-res_spline = gee_spline.fit()
-print(res_spline.summary())
-
-# --------------------
-# 4) Build prediction grids and get predicted probs + CI for each model
-# --------------------
-share_seq = np.linspace(0, 1, 200)
-pred_list = []
-for t in [0,1]:
-    # base pred df
-    base = pd.DataFrame({
-        'is_target_member': np.repeat(t, len(share_seq)),
-        'presc_target_share': share_seq,
-        'is_new_member': np.repeat(0, len(share_seq))  # fix new member = 0; change if needed
-    })
-    # linear model preds
-    lin_pred = predict_with_ci(res_lin, base)
-    lin_pred['model'] = 'linear'
-    # quadratic: add square col
-    base_q = base.copy()
-    base_q['presc_target_share_sq'] = base_q['presc_target_share']**2
-    quad_pred = predict_with_ci(res_quad, base_q)
-    quad_pred['model'] = 'quadratic'
-    # spline: build spline basis for each share
-    spline_X = dmatrix("bs(presc_target_share, knots=knots, degree=3, include_intercept=False)",
-                       {"presc_target_share": base['presc_target_share']}, return_type='dataframe')
-    spline_X.columns = [f"spline_{i}" for i in range(spline_X.shape[1])]
-    base_s = pd.concat([base.reset_index(drop=True), spline_X.reset_index(drop=True)], axis=1)
-    spline_pred = predict_with_ci(res_spline, base_s)
-    spline_pred['model'] = 'spline'
-    # combine
-    pred_list.append(pd.concat([lin_pred, quad_pred, spline_pred], ignore_index=True))
-
-pred_df_all = pd.concat(pred_list, ignore_index=True)
-
-# --------------------
-# 5) Plot predicted curves with CI, and optionally truncate to region with data support
-# --------------------
-# compute support: where we have at least N obs per bin; choose N=20 (tuneable)
-bin_support = df.groupby(pd.cut(df['presc_target_share'], bins=np.linspace(0,1,21))).size()
-valid_bins = bin_support[bin_support >= 20].index  # bins with >=20 observations
-# get min/max share with sufficient data
-if len(valid_bins) > 0:
-    lower_support = valid_bins[0].left
-    upper_support = valid_bins[-1].right
-else:
-    lower_support, upper_support = 0.0, 1.0
-
-plt.figure(figsize=(10,6))
-models_to_plot = ['linear','quadratic','spline']
-colors = {'linear':'C0','quadratic':'C1','spline':'C2'}
-for t, label_mark in zip([0,1], ['Control','Target']):
-    subset = pred_df_all[pred_df_all['is_target_member']==t]
-    for m in models_to_plot:
-        ssub = subset[subset['model']==m]
-        # apply truncation to region with support (optional)
-        ssub_plot = ssub[(ssub['presc_target_share'] >= lower_support) & (ssub['presc_target_share'] <= upper_support)]
-        plt.plot(ssub_plot['presc_target_share'], ssub_plot['pred_prob'], color=colors[m], linestyle='--' if t==0 else '-', label=f"{m} - {label_mark}" if t==1 else f"{m} - {label_mark}")
-        plt.fill_between(ssub_plot['presc_target_share'], ssub_plot['prob_low'], ssub_plot['prob_high'], color=colors[m], alpha=0.1)
-
-plt.xlabel("Prescriber Target Share")
-plt.ylabel("Predicted Probability of Conversion (150d)")
-plt.title("Predicted probabilities by model (linear / quadratic / spline) and Target vs Control")
-plt.legend(loc='best', fontsize=9)
-plt.ylim(0,1)
-plt.grid(alpha=0.2)
-plt.show()
-
-# --------------------
-# 6) Diagnostics: influence of prescribers (optional)
-#    Compute prescriber-level leverage-like info: group-level means and check for extreme prescribers
-# --------------------
-pres = df.groupby('npi_id').agg(
-    total_members=('npi_id','count'),
-    mean_share=('presc_target_share','mean'),
-    mean_conversion=('EDS_conversion_flag_150d','mean'),
-    pct_target=('is_target_member','mean')
-).reset_index()
-# show extreme prescribers at high share
-print("\nTop prescribers by presc_target_share (n>=5):")
-print(pres[pres['total_members']>=5].sort_values('mean_share', ascending=False).head(10))
-
-# --------------------
-# 7) Recommendation printout
-# --------------------
-print("\nRECOMMENDATIONS:")
-print("1) Check the barplots above: if there are very few targeted members (or few total members) beyond presc_target_share ~0.5, predictions there are extrapolations.")
-print("2) Prefer quadratic or spline models (spline shown) — they often remove the monotonic decline when the true relationship saturates.")
-print("3) If a few prescribers with large leverage exist, inspect them and consider sensitivity: re-fit models excluding them to see robustness.")
-print("4) Consider hierarchical (GLMM) or Bayesian multilevel models if you want principled shrinkage for small prescribers.")
