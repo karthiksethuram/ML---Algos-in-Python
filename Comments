@@ -53,3 +53,62 @@ itt_model = smf.glm(
 
 print("\n=== Average Outreach Effect (ITT) ===")
 print(itt_model.summary())
+
+
+
+###################
+# additional
+#############
+
+import pandas as pd
+from statsmodels.stats.proportion import proportions_ztest
+
+# Example: df has one row per (share_bin, is_target_member)
+# Columns: ['share_bin', 'is_target_member', 'n_members', 'n_converted']
+
+# Pivot the table so we can access control and target side-by-side
+pivot = (
+    df.pivot(index='share_bin', columns='is_target_member', values=['n_members', 'n_converted'])
+)
+pivot.columns = ['n_members_control', 'n_members_target', 'n_conv_control', 'n_conv_target']
+
+results = []
+for idx, row in pivot.iterrows():
+    count = [row['n_conv_target'], row['n_conv_control']]
+    nobs = [row['n_members_target'], row['n_members_control']]
+    
+    # Run two-proportion z-test
+    stat, pval = proportions_ztest(count, nobs)
+    
+    delta = (row['n_conv_target']/row['n_members_target']) - (row['n_conv_control']/row['n_members_control'])
+    
+    results.append({
+        'share_bin': idx,
+        'conv_rate_target': row['n_conv_target']/row['n_members_target'],
+        'conv_rate_control': row['n_conv_control']/row['n_members_control'],
+        'delta': delta,
+        'p_value': pval
+    })
+
+pval_df = pd.DataFrame(results)
+print(pval_df)
+
+import seaborn as sns
+import matplotlib.pyplot as plt
+
+plt.figure(figsize=(8,5))
+sns.barplot(data=pval_df, x='share_bin', y='delta', palette='coolwarm', edgecolor='black')
+
+for i, row in pval_df.iterrows():
+    sig = '*' if row['p_value'] < 0.05 else ''
+    plt.text(i, row['delta'] + 0.005, sig, ha='center', va='bottom', fontsize=12)
+
+plt.axhline(0, color='gray', linestyle='--')
+plt.title("Conversion Rate Delta (Target - Control) by Prescriber Exposure Bin")
+plt.ylabel("Conversion Delta")
+plt.xlabel("Prescriber Target Share Bin")
+plt.show()
+
+from statsmodels.stats.multitest import multipletests
+pval_df['p_adj'] = multipletests(pval_df['p_value'], method='fdr_bh')[1]
+
