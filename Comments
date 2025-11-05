@@ -1,75 +1,55 @@
-# compute presc_share_excl_self
-# df has columns: npi_id, member_id, is_target_member (0/1)
-presc_counts = df.groupby('npi_id')['is_target_member'].sum().rename('presc_treated_count')
-presc_total = df.groupby('npi_id')['member_id'].count().rename('presc_total_count')
-presc_df = pd.concat([presc_counts, presc_total], axis=1).reset_index()
-
-df = df.merge(presc_df, on='npi_id', how='left')
-# leave-one-out numerator and denominator
-df['presc_treated_excl'] = df['presc_treated_count'] - df['is_target_member']
-df['presc_total_excl'] = df['presc_total_count'] - 1
-# avoid divide-by-zero
-df['presc_target_share_excl_self'] = df['presc_treated_excl'] / df['presc_total_excl'].replace(0, np.nan)
-
-
-df['bin'] = pd.cut(df['presc_target_share_excl_self'], bins=np.linspace(0,1,11))
-summary = (df.groupby(['bin','is_target_member'])
-             .agg(n_members=('member_id','count'),
-                  n_prescribers=('npi_id', lambda x: x.nunique()),
-                  conv_rate=('EDS_conversion_flag_150d', 'mean'))
-             .reset_index())
-print(summary)
-
-
-df['presc_share_c'] = df['presc_target_share_excl_self'] - df['presc_target_share_excl_self'].mean()
-gee_formula = "EDS_conversion_flag_150d ~ is_target_member + presc_share_c + is_target_member:presc_share_c + is_new_member"
-gee_model = smf.gee(formula=gee_formula, groups="npi_id", data=df,
-                   cov_struct=Exchangeable(), family=Binomial())
-gee_result = gee_model.fit()
-print(gee_result.summary())
-
-import pandas as pd
+# Required packages
 import numpy as np
+import pandas as pd
+import statsmodels.api as sm
+import statsmodels.formula.api as smf
 from statsmodels.stats.proportion import proportion_confint
+from statsmodels.genmod.families import Binomial
+from statsmodels.genmod.cov_struct import Exchangeable
+from patsy import dmatrix
+from math import sqrt
+import matplotlib.pyplot as plt
+import warnings
+warnings.filterwarnings("ignore")
 
-# 1️⃣ Define bins for prescriber share (feel free to adjust!)
-bins = [0, 0.2, 0.4, 0.6, 0.8, 1.0]
-labels = ['0-20%', '20-40%', '40-60%', '60-80%', '80-100%']
+# -------------------------
+# 0. Prepare dataframe
+# -------------------------
+# Replace this with your actual df load if needed.
+# df = pd.read_csv("your_data.csv")
 
-df['share_bin'] = pd.cut(df['presc_target_share_excl_self'], bins=bins, labels=labels, include_lowest=True)
+# Ensure required columns exist
+required = ['member_id','npi_id','is_target_member','EDS_conversion_flag_150d']
+for c in required:
+    if c not in df.columns:
+        raise ValueError(f"Missing required column: {c}")
 
-# 2️⃣ Group by bin & target/control
-summary = (df.groupby(['share_bin', 'is_target_member'])
-             .agg(
-                 n_members=('EDS_conversion_flag_150d', 'size'),
-                 n_converted=('EDS_conversion_flag_150d', 'sum'),
-                 n_prescribers=('npi_id', lambda x: x.nunique())
-             )
-             .reset_index())
+# 0.a Compute leave-one-out prescriber share if not present
+if 'presc_target_share_excl_self' not in df.columns:
+    presc_counts = df.groupby('npi_id')['is_target_member'].sum().rename('presc_treated_count')
+    presc_total = df.groupby('npi_id')['member_id'].count().rename('presc_total_count')
+    presc_df = pd.concat([presc_counts, presc_total], axis=1).reset_index()
+    df = df.merge(presc_df, on='npi_id', how='left')
+    df['presc_treated_excl'] = df['presc_treated_count'] - df['is_target_member']
+    df['presc_total_excl'] = df['presc_total_count'] - 1
+    df['presc_target_share_excl_self'] = df['presc_treated_excl'] / df['presc_total_excl'].replace(0, np.nan)
+    # replace NaN (single-member prescribers) with 0 or keep NaN depending on your preference:
+    df['presc_target_share_excl_self'] = df['presc_target_share_excl_self'].fillna(0)
+# Filter controls
+ctrl = df[df['is_target_member'] == 0].copy()
+ctrl['presc_share_c'] = ctrl['presc_target_share_excl_self'] - ctrl['presc_target_share_excl_self'].mean()
 
-# 3️⃣ Compute conversion rate + 95% CI
-summary['conv_rate'] = summary['n_converted'] / summary['n_members']
+# GLM on controls: conversion ~ prescriber share + covariates
+formula_ctrl = "EDS_conversion_flag_150d ~ presc_share_c + is_new_member"
+glm_ctrl = smf.glm(formula=formula_ctrl, data=ctrl, family=sm.families.Binomial()).fit()
+ctrl_clustered = glm_ctrl.get_robustcov_results(cov_type='cluster', groups=ctrl['npi_id'])
 
-# Wilson interval for binomial proportion confidence intervals
-ci_low = []
-ci_high = []
+print("Controls-only GLM (cluster-robust SEs):")
+print(ctrl_clustered.summary())
 
-for _, row in summary.iterrows():
-    low, high = proportion_confint(
-        count=row['n_converted'],
-        nobs=row['n_members'],
-        alpha=0.05,
-        method='wilson'
-    )
-    ci_low.append(low)
-    ci_high.append(high)
-
-summary['ci_low'] = ci_low
-summary['ci_high'] = ci_high
-
-# 4️⃣ Nicely sort bins
-summary['share_bin'] = pd.Categorical(summary['share_bin'], categories=labels, ordered=True)
-summary = summary.sort_values(['share_bin', 'is_target_member'])
-
-summary
-
+coef = ctrl_clustered.params['presc_share_c']
+# approximate average marginal effect at mean p
+p_mean = ctrl['EDS_conversion_flag_150d'].mean()
+marginal_effect = coef * p_mean * (1 - p_mean)  # delta method rough approx for small coef
+print("Approx marginal effect of +1 unit share (0-1) on prob scale:", marginal_effect)
+print("Or effect of +10 pp (0.10):", marginal_effect * 0.10)
