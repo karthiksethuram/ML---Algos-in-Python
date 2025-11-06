@@ -1,114 +1,202 @@
-import statsmodels.formula.api as smf
-import statsmodels.api as sm
-import pandas as pd
+# Save as analysis_prescriber_spillover.py or run in notebook
 import numpy as np
-
-# Create exposure bins
-df = df.copy()
-bins = [0, 0.2, 0.4, 0.6, 0.8, 1.01]
-labels = ["0-20%", "20-40%", "40-60%", "60-80%", "80-100%"]
-df['share_bin'] = pd.cut(df['presc_target_share'], bins=bins, labels=labels, include_lowest=True)
-
-#################################################
-# 1️⃣ Spillover Test — Control only
-#################################################
-spill_model = smf.glm(
-    formula="EDS_conversion_flag_150d ~ presc_target_share + is_new_member",
-    data=df[df.is_target_member == 0],
-    family=sm.families.Binomial()
-).fit(cov_type='HC3')
-
-print("\n=== Spillover Effect (Control Only) ===")
-print(spill_model.summary())
-
-
-#################################################
-# 2️⃣ Diminishing Returns (Saturation) Test
-#################################################
-diminish_model = smf.glm(
-    formula="""
-        EDS_conversion_flag_150d ~ 
-            is_target_member +
-            presc_target_share +
-            I(presc_target_share**2) +
-            is_target_member:presc_target_share +
-            is_new_member
-    """,
-    data=df,
-    family=sm.families.Binomial()
-).fit(cov_type='HC3')
-
-print("\n=== Diminishing Returns (Saturation Test) ===")
-print(diminish_model.summary())
-
-
-#################################################
-# 3️⃣ Overall Outreach Effect (Average ITT)
-#################################################
-itt_model = smf.glm(
-    formula="EDS_conversion_flag_150d ~ is_target_member + is_new_member",
-    data=df,
-    family=sm.families.Binomial()
-).fit(cov_type='HC3')
-
-print("\n=== Average Outreach Effect (ITT) ===")
-print(itt_model.summary())
-
-
-
-###################
-# additional
-#############
-
 import pandas as pd
-from statsmodels.stats.proportion import proportions_ztest
-
-# Example: df has one row per (share_bin, is_target_member)
-# Columns: ['share_bin', 'is_target_member', 'n_members', 'n_converted']
-
-# Pivot the table so we can access control and target side-by-side
-pivot = (
-    df.pivot(index='share_bin', columns='is_target_member', values=['n_members', 'n_converted'])
-)
-pivot.columns = ['n_members_control', 'n_members_target', 'n_conv_control', 'n_conv_target']
-
-results = []
-for idx, row in pivot.iterrows():
-    count = [row['n_conv_target'], row['n_conv_control']]
-    nobs = [row['n_members_target'], row['n_members_control']]
-    
-    # Run two-proportion z-test
-    stat, pval = proportions_ztest(count, nobs)
-    
-    delta = (row['n_conv_target']/row['n_members_target']) - (row['n_conv_control']/row['n_members_control'])
-    
-    results.append({
-        'share_bin': idx,
-        'conv_rate_target': row['n_conv_target']/row['n_members_target'],
-        'conv_rate_control': row['n_conv_control']/row['n_members_control'],
-        'delta': delta,
-        'p_value': pval
-    })
-
-pval_df = pd.DataFrame(results)
-print(pval_df)
-
-import seaborn as sns
 import matplotlib.pyplot as plt
+from patsy import dmatrix
+import statsmodels.api as sm
+import statsmodels.formula.api as smf
+from statsmodels.stats.proportion import proportions_ztest
+from scipy import stats
+import itertools
+import warnings
+warnings.filterwarnings('ignore')
 
-plt.figure(figsize=(8,5))
-sns.barplot(data=pval_df, x='share_bin', y='delta', palette='coolwarm', edgecolor='black')
+# ---- load your dataframe ----
+# df must contain: eph_id, npi_id, is_target_member (0/1), presc_target_share_excl_self (0-1), is_new_member (0/1), converted (0/1)
+# I assume your outcome column is named 'converted' (EDS conversion within 150 days). Rename if needed.
+# Example: df = pd.read_csv("your_table.csv")
+# For this snippet, replace with your actual loading step.
+# df = pd.read_csv("...")
 
-for i, row in pval_df.iterrows():
-    sig = '*' if row['p_value'] < 0.05 else ''
-    plt.text(i, row['delta'] + 0.005, sig, ha='center', va='bottom', fontsize=12)
+# ---- Quick checks ----
+def quick_checks(df):
+    print("Rows:", len(df))
+    print("Unique prescribers:", df['npi_id'].nunique())
+    print("Target share: min/max/mean:", df['presc_target_share_excl_self'].min(), df['presc_target_share_excl_self'].max(), df['presc_target_share_excl_self'].mean())
+    print("Conversion rate overall:", df['converted'].mean())
+    print("Conversion by is_target:")
+    print(df.groupby('is_target_member')['converted'].agg(['mean','count']))
 
-plt.axhline(0, color='gray', linestyle='--')
-plt.title("Conversion Rate Delta (Target - Control) by Prescriber Exposure Bin")
-plt.ylabel("Conversion Delta")
-plt.xlabel("Prescriber Target Share Bin")
-plt.show()
+# ---- Binwise descriptive table + z-tests ----
+def binwise_table(df, share_col='presc_target_share_excl_self', bins=[0,0.2,0.4,0.6,0.8,1.0]):
+    df = df.copy()
+    labels = [f"{int(100*bins[i])}-{int(100*bins[i+1])}%" for i in range(len(bins)-1)]
+    df['share_bin'] = pd.cut(df[share_col], bins=bins, labels=labels, include_lowest=True, right=False)
+    rows = []
+    for b in labels:
+        for t in [0,1]:
+            sub = df[(df['share_bin']==b) & (df['is_target_member']==t)]
+            n = len(sub)
+            conv = sub['converted'].sum()
+            rate = conv / n if n>0 else np.nan
+            rows.append((b,t,n,conv,rate))
+    tab = pd.DataFrame(rows, columns=['share_bin','is_target_member','n_members','n_converted','conv_rate'])
+    # compute two-proportion z-test between target and control per bin
+    zres = []
+    for b in labels:
+        control = tab[(tab.share_bin==b) & (tab.is_target_member==0)].iloc[0]
+        target = tab[(tab.share_bin==b) & (tab.is_target_member==1)].iloc[0]
+        count = np.array([target.n_converted, control.n_converted])
+        nobs = np.array([target.n_members, control.n_members])
+        # if any nobs zero, skip
+        if (nobs <= 0).any():
+            pval = np.nan
+        else:
+            stat, pval = proportions_ztest(count, nobs, alternative='two-sided')
+        zres.append((b, float(target.conv_rate - control.conv_rate), pval))
+    zv = pd.DataFrame(zres, columns=['share_bin','delta_target_minus_control','p_value'])
+    display = tab.pivot(index='share_bin', columns='is_target_member', values=['n_members','n_converted','conv_rate'])
+    return display, zv
 
-from statsmodels.stats.multitest import multipletests
-pval_df['p_adj'] = multipletests(pval_df['p_value'], method='fdr_bh')[1]
+# ---- VIF / collinearity check ----
+def compute_vif(df, vars):
+    from statsmodels.stats.outliers_influence import variance_inflation_factor
+    X = df[vars].dropna().assign(const=1)
+    vifs = {v: variance_inflation_factor(X.values, i) for i,v in enumerate(X.columns)}
+    return vifs
 
+# ---- Flexible logistic regression with spline and interaction ----
+def logistic_spline_interaction(df, share_col='presc_target_share_excl_self'):
+    # create spline basis (natural cubic spline with 4 df)
+    spline = dmatrix("bs(%s, df=4, include_intercept=False)" % share_col, {"%s" % share_col: df[share_col]}, return_type='dataframe')
+    # rename spline cols so they join easily
+    spline.columns = [f"spl_{i}" for i in range(spline.shape[1])]
+    data = pd.concat([df[['converted','is_target_member','is_new_member','npi_id']], spline], axis=1).dropna()
+    # build formula: converted ~ is_target + spline terms + is_target:spline terms + is_new_member
+    spline_terms = " + ".join(spline.columns)
+    interaction_terms = " + ".join([f"is_target_member:{c}" for c in spline.columns])
+    formula = "converted ~ is_target_member + is_new_member + %s + %s" % (spline_terms, interaction_terms)
+    print("Formula:", formula)
+    model = smf.glm(formula=formula, data=data, family=sm.families.Binomial()).fit()
+    print(model.summary())
+    # cluster robust SE by prescriber
+    clustered = model.get_robustcov_results(cov_type='cluster', groups=data["npi_id"])
+    print("\nCluster-robust (by prescriber) summary:\n")
+    print(clustered.summary())
+    return model, clustered, spline
+
+# ---- GEE clustered by prescriber (exchangeable) ----
+def gee_logit(df, share_col='presc_target_share_excl_self'):
+    # simple GEE: converted ~ is_target * share + is_new_member
+    # include both linear and squared share to allow curvature
+    data = df.copy().dropna(subset=['converted','is_target_member',share_col,'npi_id'])
+    data['share_sq'] = data[share_col]**2
+    formula = "converted ~ is_target_member * ({share} + share_sq) + is_new_member".format(share=share_col)
+    print("GEE formula:", formula)
+    fam = sm.families.Binomial()
+    gee = smf.gee(formula, "npi_id", data, cov_struct=sm.cov_struct.Exchangeable(), family=fam).fit()
+    print(gee.summary())
+    return gee
+
+# ---- Marginal effects: predict on grid and plot ----
+def marginal_effects_plot(df, model, spline, share_col='presc_target_share_excl_self', grid_points=50):
+    # build dataframe for prediction
+    grid = np.linspace(0,1,grid_points)
+    # build spline basis on grid using same dmatrix
+    grid_spline = dmatrix("bs(x, df=4, include_intercept=False)", {"x": grid}, return_type='dataframe')
+    grid_spline.columns = spline.columns
+    # baseline is_new_member = 0 (or use mean), we will show both target 0/1
+    preds = []
+    for is_t in [0,1]:
+        dd = pd.DataFrame({ 'is_target_member': is_t, 'is_new_member': 0})
+        # replicate spline columns
+        for c in grid_spline.columns:
+            dd[c] = grid_spline[c].values
+        # predict with GLM model
+        pred_lin = model.predict(dd)
+        # model.predict returns mean response on probability scale for GLM Binomial
+        preds.append(pred_lin)
+    # plot
+    plt.figure(figsize=(8,5))
+    plt.plot(grid, preds[0], label='Control (is_target=0)')
+    plt.plot(grid, preds[1], label='Target (is_target=1)')
+    plt.xlabel("Prescriber target share (excl self)")
+    plt.ylabel("Predicted probability of conversion")
+    plt.legend()
+    plt.title("Predicted conversion prob vs prescriber share")
+    plt.grid(True)
+    plt.show()
+    # treatment effect curve
+    te = preds[1] - preds[0]
+    plt.figure(figsize=(8,4))
+    plt.plot(grid, te, label='Treatment effect (Target - Control)')
+    plt.axhline(0, color='k', linestyle='--')
+    plt.xlabel("Prescriber target share (excl self)")
+    plt.ylabel("Absolute treatment effect")
+    plt.title("Estimated treatment effect by prescriber exposure")
+    plt.grid(True)
+    plt.show()
+    return grid, preds, te
+
+# ---- Simple permutation test for spillover among controls ----
+def permutation_test_spillover(df, share_col='presc_target_share_excl_self', n_perms=2000, high_threshold=0.5):
+    # null: no spillover -> conversion among controls independent of share
+    # statistic: difference in control conversion rates between high-share and low-share prescribers
+    ctrl = df[df['is_target_member']==0].copy()
+    # define high vs low prescriber exposure groups by threshold
+    ctrl['high_share'] = (ctrl[share_col] >= high_threshold).astype(int)
+    obs_diff = ctrl.groupby('high_share')['converted'].mean().diff().iloc[-1]  # high - low
+    # permutation: shuffle converted among control units (preserves n and share distribution)
+    diffs = []
+    for i in range(n_perms):
+        shuffled = ctrl['converted'].sample(frac=1, replace=False).values
+        diff = ctrl.assign(conv_perm=shuffled).groupby('high_share')['conv_perm'].mean().diff().iloc[-1]
+        diffs.append(diff)
+    diffs = np.array(diffs)
+    pval = (np.abs(diffs) >= np.abs(obs_diff)).mean()
+    print("Observed control high-low conversion diff (high - low):", obs_diff)
+    print("Permutation p-value:", pval)
+    # quick plot
+    plt.figure(figsize=(6,4))
+    plt.hist(diffs, bins=50, alpha=0.8)
+    plt.axvline(obs_diff, color='r', label='observed')
+    plt.xlabel("Permutation diffs (high - low)")
+    plt.legend()
+    plt.title("Permutation test (controls only) - spillover signal")
+    plt.show()
+    return obs_diff, pval
+
+# ---- How to run everything (example) ----
+def run_all(df):
+    quick_checks(df)
+    display, zv = binwise_table(df)
+    print("Binwise table (pivot):")
+    print(display)
+    print("\nPer-bin delta and p-values:")
+    print(zv)
+    # VIF / collinearity
+    vifs = compute_vif(df, ['is_target_member','presc_target_share_excl_self','is_new_member'])
+    print("VIFs:", vifs)
+    # logistic with spline + interaction
+    model, clustered, spline = logistic_spline_interaction(df)
+    # marginal effects plot
+    marginal_effects_plot(df, model, spline)
+    # GEE
+    gee = gee_logit(df)
+    # permutation test among controls for spillover
+    obs_diff, pval = permutation_test_spillover(df)
+    print("Permutation test result:", obs_diff, pval)
+    return {
+        'bin_table': display,
+        'bin_test': zv,
+        'vifs': vifs,
+        'glm': model,
+        'glm_clustered': clustered,
+        'gee': gee,
+        'perm_obs_diff': obs_diff,
+        'perm_pval': pval
+    }
+
+# ---- Example usage ----
+# results = run_all(df)
+# adjust column names and run
