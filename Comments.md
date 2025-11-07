@@ -1,3 +1,16 @@
+Even though members were randomized, prescriber-level exposure wasn’t — it’s induced by the member randomization.
+High-presc_share prescribers tend to have more targeted members, but they may also differ systematically in ways that correlate with conversion:
+
+they may use the EHR more actively,
+
+serve a population that’s more adherent, or
+
+have stronger follow-up processes.
+
+So presc_share_excl_self could be partly proxying for prescriber quality / engagement, not pure spillover.
+
+You can’t completely eliminate that without controlling for prescriber-level fixed effects or random effects — which is exactly why we tried FE / mixed models earlier.
+
 Nice — you’ve already run the right family of approaches. Below I’ll explain why each model was chosen, what it estimates / assumes, why one would group by npi_id vs eph_id, what cov_type='clustered' does, and how these choices change interpretation vs plain OLS / logit. I’ll finish with clear practical guidance on which results to trust for each question you care about (spillover, diminishing returns, overall effect) and a few diagnostics to run.
 
 1) Short summary (TL;DR)
