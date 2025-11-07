@@ -1,183 +1,74 @@
-# Chunk 0: imports + load
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
 import statsmodels.api as sm
-import statsmodels.formula.api as smf
-from statsmodels.stats.proportion import proportions_ztest
-from statsmodels.stats.outliers_influence import variance_inflation_factor
-import warnings
-warnings.filterwarnings('ignore')
+from linearmodels.panel import PanelOLS
 
-# Load your data (update path)
-# df must contain columns:
-# 'experiment_uid', 'eph_id', 'npi_id', 'is_target_member' (0/1),
-# 'presc_target_share' (0-1), 'presc_target_share_excl_self' (0-1),
-# 'is_new_member' (0/1), 'EDS_conversion_flag_150d' (0/1)
-df = pd.read_csv("your_file.csv")
-# quick sanity
-print("Rows:", len(df))
-print("Unique experiment_uid:", df['experiment_uid'].nunique())
-print("Unique prescribers:", df['npi_id'].nunique())
+# Set panel index: prescriber (entity) and unique row
+df = df.set_index(["npi_id","experiment_uid"])
 
-# Chunk 1: dedupe to experiment_uid-level for binwise summaries and proportions
-# If experiment_uid is unique per row already, this just confirms it.
-# If multiple rows per experiment_uid exist, we take the first (adjust logic if needed).
-df_exp = df.drop_duplicates(subset=['experiment_uid']).copy()
-print("After dedupe by experiment_uid:", len(df_exp))
-
-# verify columns
-print(df_exp[['experiment_uid','eph_id','npi_id','is_target_member','presc_target_share_excl_self','EDS_conversion_flag_150d']].head())
+# Fixed effects model with prescriber FE
+model_full = PanelOLS.from_formula(
+    "EDS_conversion_flag_150d ~ is_target_member + presc_target_share_excl_self + "
+    "is_target_member:presc_target_share_excl_self + is_new_member + EntityEffects",
+    data=df
+)
+res_full = model_full.fit(cov_type="clustered", cluster_entity=True)
+print(res_full.summary)
 
 
+pure_df = df.loc[
+    (df["presc_target_share_excl_self"] == 0) |
+    (df["presc_target_share_excl_self"] == 1)
+]
 
+model_pure = PanelOLS.from_formula(
+    "EDS_conversion_flag_150d ~ is_target_member + presc_target_share_excl_self + "
+    "is_target_member:presc_target_share_excl_self + is_new_member + EntityEffects",
+    data=pure_df
+)
+res_pure = model_pure.fit(cov_type="clustered", cluster_entity=True)
+print(res_pure.summary)
 
-# Chunk 2: bin-wise table & two-proportion z-tests using experiment_uid-level units
-bins = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
-labels = [f"{int(100*bins[i])}-{int(100*bins[i+1])}%" for i in range(len(bins)-1)]
-df_exp['share_bin'] = pd.cut(df_exp['presc_target_share_excl_self'], bins=bins, labels=labels, include_lowest=True, right=False)
+import matplotlib.pyplot as plt
+import numpy as np
 
-rows = []
-for b in labels:
-    for t in [0,1]:
-        sub = df_exp[(df_exp['share_bin']==b) & (df_exp['is_target_member']==t)]
-        n = len(sub)
-        n_conv = sub['EDS_conversion_flag_150d'].sum()
-        rate = n_conv / n if n>0 else np.nan
-        rows.append({'share_bin': b, 'is_target_member': t, 'n_members': n, 'n_converted': int(n_conv), 'conv_rate': rate})
-bin_table = pd.DataFrame(rows)
-print(bin_table.pivot(index='share_bin', columns='is_target_member', values=['n_members','n_converted','conv_rate']))
+# Extract coefficients from the full model
+b = res_full.params
+b_target   = b["is_target_member"]
+b_share    = b["presc_target_share_excl_self"]
+b_int      = b["is_target_member:presc_target_share_excl_self"]
 
-# z-test (target vs control) per bin
-ztest_results = []
-for b in labels:
-    control = bin_table[(bin_table.share_bin==b) & (bin_table.is_target_member==0)].iloc[0]
-    target  = bin_table[(bin_table.share_bin==b) & (bin_table.is_target_member==1)].iloc[0]
-    count = np.array([target['n_converted'], control['n_converted']])
-    nobs  = np.array([target['n_members'], control['n_members']])
-    if (nobs <= 0).any():
-        pval = np.nan
-        stat = np.nan
-    else:
-        stat, pval = proportions_ztest(count, nobs, alternative='two-sided')
-    ztest_results.append({'share_bin': b, 'delta': target['conv_rate'] - control['conv_rate'], 'z_stat': stat, 'p_value': pval})
-ztest_df = pd.DataFrame(ztest_results)
-print("\nPer-bin delta and p-values:")
-print(ztest_df)
+share_grid = np.linspace(0,1,50)
+control_rate = b_share * share_grid
+target_rate  = b_target + (b_share + b_int)*share_grid
 
-# Chunk 3: VIF (use the deduped df_exp for VIF)
-X = df_exp[['is_target_member','presc_target_share_excl_self','is_new_member']].dropna().copy()
-X['const'] = 1.0
-vif = pd.DataFrame()
-vif['variable'] = X.columns
-vif['VIF'] = [variance_inflation_factor(X.values, i) for i in range(X.shape[1])]
-print(vif)
-
-
-# Chunk 4: LPM with prescriber fixed effects (full data)
-# Formula: EDS_conversion_flag_150d ~ is_target_member * presc_target_share_excl_self + is_new_member + C(npi_id)
-# We will cluster-robust SE by prescriber (npi_id)
-df_fe = df.copy()   # using original df, not deduped, unless you want experiment_uid-level only
-formula = "EDS_conversion_flag_150d ~ is_target_member * presc_target_share_excl_self + is_new_member + C(npi_id)"
-print("Estimating LPM with prescriber FE on full data ... (this creates many dummies if many prescribers)")
-
-# Fit OLS
-model_fe = smf.ols(formula=formula, data=df_fe).fit()
-# Clustered SEs by prescriber
-clustered_fe = model_fe.get_robustcov_results(cov_type='cluster', groups=df_fe['npi_id'])
-print(clustered_fe.summary())
-
-
-# Chunk 5: GLM (Logit) with prescriber dummies; cluster SE by npi_id
-# WARNING: this also creates many dummies; logistic with many dummies may be slow and might not converge for perfectly separated prescribers
-formula_glm = "EDS_conversion_flag_150d ~ is_target_member * presc_target_share_excl_self + is_new_member + C(npi_id)"
-
-print("Estimating GLM (Binomial, logit link) with prescriber dummies (full data).")
-glm_model = smf.glm(formula=formula_glm, data=df_fe, family=sm.families.Binomial()).fit()
-glm_clustered = glm_model.get_robustcov_results(cov_type='cluster', groups=df_fe['npi_id'])
-print(glm_clustered.summary())
-
-
-# Chunk 6: identify prescribers with prescriber-level mean(is_target_member) == 0 or 1
-# compute prescriber-level average targeting using deduped experiment_uid or full df depending on how you want to measure
-# We'll use df_exp (experiment_uid-level) to calculate prescriber purity
-presc_share = df_exp.groupby('npi_id')['is_target_member'].mean().reset_index().rename(columns={'is_target_member':'presc_level_share'})
-print("Prescriber share distribution sample:")
-print(presc_share['presc_level_share'].value_counts().head())
-
-pure_prescribers = presc_share[presc_share['presc_level_share'].isin([0.0,1.0])]['npi_id'].unique()
-print("Number of pure prescribers (share==0 or 1):", len(pure_prescribers))
-
-# subset original df to rows whose npi_id is in pure_prescribers
-df_pure = df[df['npi_id'].isin(pure_prescribers)].copy()
-print("Rows in pure prescribers subset:", len(df_pure))
-print("Unique prescribers in subset:", df_pure['npi_id'].nunique())
-print("Summary of conversions in subset:", df_pure['EDS_conversion_flag_150d'].mean())
-
-# Chunk 7: LPM with prescriber FE on subset (pure prescribers)
-formula = "EDS_conversion_flag_150d ~ is_target_member * presc_target_share_excl_self + is_new_member + C(npi_id)"
-print("Estimating LPM with prescriber FE on pure-prescriber subset ...")
-model_pure_fe = smf.ols(formula=formula, data=df_pure).fit()
-clustered_pure = model_pure_fe.get_robustcov_results(cov_type='cluster', groups=df_pure['npi_id'])
-print(clustered_pure.summary())
-# Chunk 8: GLM (logit) on pure prescriber subset
-formula_glm = "EDS_conversion_flag_150d ~ is_target_member * presc_target_share_excl_self + is_new_member + C(npi_id)"
-print("Estimating GLM (logit) with prescriber dummies on pure-prescriber subset ...")
-glm_pure = smf.glm(formula=formula_glm, data=df_pure, family=sm.families.Binomial()).fit()
-glm_pure_clustered = glm_pure.get_robustcov_results(cov_type='cluster', groups=df_pure['npi_id'])
-print(glm_pure_clustered.summary())
-
-
-# Chunk 9: predicted marginal effects from a fitted GLM or OLS (example uses glm_model from Chunk 5)
-# Build grid of prescriber share and predict for is_target_member 0/1
-model_to_use = glm_model  # or clustered_fe, model_fe, model_pure_fe, glm_pure
-grid = np.linspace(0,1,51)
-preds_control = []
-preds_target = []
-for share in grid:
-    # build a dataframe of prediction rows (is_new_member set to 0; change if you want average)
-    df_pred_c = pd.DataFrame([{
-        'is_target_member': 0,
-        'presc_target_share_excl_self': share,
-        'is_new_member': 0,
-        'npi_id': df_fe['npi_id'].iloc[0]  # dummy prescriber to satisfy model matrix for C(npi_id); will use the first prescriber
-    }])
-    df_pred_t = df_pred_c.copy()
-    df_pred_t['is_target_member'] = 1
-    # For GLM, use model_to_use.predict()
-    preds_control.append(model_to_use.predict(df_pred_c)[0])
-    preds_target.append(model_to_use.predict(df_pred_t)[0])
-
-plt.figure(figsize=(8,5))
-plt.plot(grid, preds_control, label='Control (is_target=0)')
-plt.plot(grid, preds_target, label='Target (is_target=1)')
-plt.xlabel('presc_target_share_excl_self')
-plt.ylabel('Predicted probability of conversion')
-plt.title('Predicted Prob by prescriber share (example)')
+plt.figure(figsize=(6,4))
+plt.plot(share_grid, control_rate, label="Control")
+plt.plot(share_grid, target_rate, label="Target")
+plt.xlabel("Prescriber Target Share (excl. self)")
+plt.ylabel("Predicted ΔConversion")
+plt.title("Marginal Effects: Targeting × Prescriber Exposure")
 plt.legend()
-plt.grid(True)
+plt.grid(True, alpha=0.3)
 plt.show()
 
-# Treatment effect curve
-te = np.array(preds_target) - np.array(preds_control)
-plt.figure(figsize=(8,4))
-plt.plot(grid, te)
-plt.axhline(0, linestyle='--', color='k')
-plt.xlabel('presc_target_share_excl_self')
-plt.ylabel('Treatment effect (Target - Control)')
-plt.title('Estimated treatment effect by prescriber exposure')
-plt.grid(True)
-plt.show()
+# Compute prescriber means
+presc_means = df.groupby("npi_id")[["EDS_conversion_flag_150d",
+                                    "is_target_member",
+                                    "presc_target_share_excl_self",
+                                    "is_new_member"]].transform("mean")
 
-# Chunk 10: diagnostics
-# 1) Check sample size by prescriber share bins in the subset and full data
-print("Full data rows by share bin (exp-level):")
-print(df_exp['share_bin'].value_counts().sort_index())
-print("Pure-prescriber subset share bin counts:")
-print(df_pure.groupby(pd.cut(df_pure['presc_target_share_excl_self'], bins=bins, labels=labels, include_lowest=True))['EDS_conversion_flag_150d'].count())
+df_w = df[["EDS_conversion_flag_150d","is_target_member",
+           "presc_target_share_excl_self","is_new_member"]] - presc_means
 
-# 2) Check number of prescribers who have both treated and controls (needed for within-prescriber identification)
-presc_counts = df.groupby('npi_id')['is_target_member'].nunique().reset_index(name='n_unique_treatment_vals')
-print("Prescribers with both treated & control:", (presc_counts['n_unique_treatment_vals']>1).sum())
+# Regression on de-meaned data
+X = sm.add_constant(df_w[["is_target_member",
+                          "presc_target_share_excl_self",
+                          "is_target_member"]].assign(
+                          interaction=df_w["is_target_member"]*df_w["presc_target_share_excl_self"],
+                          is_new_member=df_w["is_new_member"]))
+
+y = df_w["EDS_conversion_flag_150d"]
+fast_model = sm.OLS(y, X).fit()
+print(fast_model.summary())
+
 
 
